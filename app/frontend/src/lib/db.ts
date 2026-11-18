@@ -1,0 +1,560 @@
+import Dexie, { Table } from "dexie";
+import { QuestionDetail } from "@/types/api";
+
+declare global {
+  interface Window {
+    Clerk?: {
+      loaded?: boolean;
+      user?: {
+        id: string;
+      };
+    };
+  }
+}
+
+/**
+ * Retorna o identificador de proprietário dos dados locais (IndexedDB).
+ * Se o usuário estiver autenticado no Clerk, retorna seu ID real.
+ * Caso contrário, retorna o UUID persistente de visitante em localStorage.
+ */
+export function getLocalOwnerId(): string {
+  if (typeof window === "undefined") {
+    return "ssr_dummy_owner";
+  }
+  const clerkUser = window.Clerk?.user?.id;
+  if (clerkUser) {
+    try {
+      localStorage.setItem("medquest_last_user_id", clerkUser);
+    } catch {
+      // Storage unavailable or quota exceeded
+    }
+    return clerkUser;
+  }
+
+  // During early hydration before Clerk SDK loads, check if we have a known logged-in user
+  try {
+    const lastUser = localStorage.getItem("medquest_last_user_id");
+    if (lastUser && isDeviceOffline() && !window.Clerk?.loaded) return lastUser;
+    if (window.Clerk?.loaded) localStorage.removeItem("medquest_last_user_id");
+  } catch {
+    // Storage unavailable
+  }
+
+  let ownerId: string | null = null;
+  try {
+    ownerId = localStorage.getItem("medquest_local_owner");
+    if (!ownerId || ownerId === "guest" || ownerId === "server") {
+      ownerId = crypto.randomUUID();
+      localStorage.setItem("medquest_local_owner", ownerId);
+    }
+  } catch {
+    ownerId = "fallback_local_owner";
+  }
+  return ownerId;
+}
+
+/** Wait for Clerk before restoring signed-in data; demo and offline sessions work without it. */
+export function isLocalIdentityReady(authLoaded: boolean): boolean {
+  return authLoaded || isDeviceOffline() || document.cookie.split(";").some(cookie => cookie.trim() === "medquest_demo=1");
+}
+
+export interface SyncItem {
+  id: string;
+  owner_id: string;
+  endpoint: string;
+  method: string;
+  body: string | null;
+  content_type: string;
+  created_at: number;
+  retry_count: number;
+  next_retry_at: number;
+  status: "pending" | "failed" | "completed";
+  last_error?: string;
+  idempotency_key: string;
+}
+
+export interface SimuladoPackage {
+  id: string;
+  owner_id: string;
+  name: string;
+  config: {
+    institutions?: string[];
+    years?: string[];
+    questions_per_area?: number;
+    duration_minutes?: number;
+    force_4_options?: boolean;
+    [key: string]: unknown;
+  };
+  question_ids: number[];
+  questions_count: number;
+  details_count: number;
+  images_count: number;
+  estimated_size_bytes: number;
+  /** The app shell was verified in Cache Storage before this package was released. */
+  shell_cached?: boolean;
+  /** Images can be unavailable without preventing question text from working offline. */
+  image_failures_count?: number;
+  status: "downloading" | "ready" | "incomplete" | "expired" | "quota_exceeded";
+  download_progress: number;
+  created_at: number;
+  updated_at: number;
+  expires_at: number;
+  version: number;
+  last_error?: string;
+}
+
+export function isPackageValid(pkg: SimuladoPackage | null | undefined): { valid: boolean; reason?: string } {
+  if (!pkg) return { valid: false, reason: "Nenhum pacote encontrado" };
+  if (pkg.status !== "ready") {
+    if (pkg.status === "downloading") return { valid: false, reason: "Download em andamento" };
+    if (pkg.status === "incomplete") return { valid: false, reason: "Pacote incompleto" };
+    if (pkg.status === "quota_exceeded") return { valid: false, reason: "Espaço insuficiente em disco" };
+    return { valid: false, reason: "Pacote não está pronto" };
+  }
+  if (Date.now() > pkg.expires_at) {
+    return { valid: false, reason: "Pacote expirado" };
+  }
+  if (pkg.questions_count === 0 || pkg.details_count < pkg.questions_count) {
+    return { valid: false, reason: "Pacote incompleto ou inconsistente" };
+  }
+  if (pkg.shell_cached !== true) {
+    return { valid: false, reason: "Atualize o pacote para preparar o aplicativo offline" };
+  }
+  return { valid: true };
+}
+
+/**
+ * Detecta se o erro capturado refere-se a esgotamento de quota de armazenamento
+ * no IndexedDB, Dexie ou Web Storage (QuotaExceededError).
+ */
+export function isQuotaExceededError(err: unknown): boolean {
+  if (!err) return false;
+
+  if (typeof DOMException !== "undefined" && err instanceof DOMException) {
+    if (err.name === "QuotaExceededError" || err.code === 22) return true;
+  }
+
+  if (err instanceof Error) {
+    if (err.name === "QuotaExceededError") return true;
+    if (typeof err.message === "string" && /quota.*exceeded/i.test(err.message)) return true;
+  }
+
+  const obj = err as {
+    name?: unknown;
+    code?: unknown;
+    message?: unknown;
+    inner?: unknown;
+    failures?: unknown[];
+  };
+
+  if (obj.name === "QuotaExceededError" || obj.code === 22) return true;
+  if (typeof obj.message === "string" && /quota.*exceeded/i.test(obj.message)) return true;
+
+  if (obj.inner && isQuotaExceededError(obj.inner)) return true;
+
+  if (Array.isArray(obj.failures)) {
+    return obj.failures.some((f) => isQuotaExceededError(f));
+  }
+
+  return false;
+}
+
+export class MedQuestDB extends Dexie {
+  questions!: Table<QuestionDetail & { _owner_id: string }, [number, string]>;
+  syncQueue!: Table<SyncItem, string>;
+  simuladoPackages!: Table<SimuladoPackage, string>;
+
+  constructor() {
+    super("MedQuestDB_v2");
+
+    this.version(1).stores({
+      questions: "[id+_user_id], id, institution_code, year, area, subtema",
+      flashcards: "[id+_user_id], id, question_id, next_review_date",
+      syncQueue: "id, user_id, timestamp",
+    });
+
+    this.version(2)
+      .stores({
+        questions: "[id+_owner_id], id, _owner_id, institution_code, year, area, subtema",
+        flashcards: "[id+_owner_id], id, _owner_id, question_id, next_review_date",
+        syncQueue: "id, owner_id, status, next_retry_at, created_at",
+      })
+      .upgrade((trans) => {
+        const currentGuestOwner = getLocalOwnerId();
+
+        return Promise.all([
+          trans
+            .table("questions")
+            .toCollection()
+            .modify((q: Record<string, unknown>) => {
+              const oldUserId = (q._user_id as string) || "1";
+              if (oldUserId.startsWith("user_")) {
+                q._owner_id = oldUserId;
+              } else {
+                q._owner_id = currentGuestOwner;
+              }
+              delete q._user_id;
+            }),
+          trans
+            .table("flashcards")
+            .toCollection()
+            .modify((f: Record<string, unknown>) => {
+              const oldUserId = (f._user_id as string) || "1";
+              if (oldUserId.startsWith("user_")) {
+                f._owner_id = oldUserId;
+              } else {
+                f._owner_id = currentGuestOwner;
+              }
+              delete f._user_id;
+            }),
+          trans
+            .table("syncQueue")
+            .toCollection()
+            .modify((s: Record<string, unknown>) => {
+              const oldUserId = (s.user_id as string) || "1";
+              s.owner_id = oldUserId.startsWith("user_") ? oldUserId : currentGuestOwner;
+              delete s.user_id;
+              s.status = s.status || "pending";
+              s.retry_count = s.retry_count || 0;
+              s.next_retry_at = s.next_retry_at || Date.now();
+              s.created_at = s.timestamp || Date.now();
+              delete s.timestamp;
+              s.idempotency_key = s.idempotency_key || crypto.randomUUID();
+
+              // v2 bug: loss of method and content-type from options
+              let optsObj: Record<string, unknown> | null = null;
+              if (typeof s.options === "string") {
+                try {
+                  optsObj = JSON.parse(s.options) as Record<string, unknown>;
+                } catch {
+                  optsObj = null;
+                }
+              } else if (typeof s.options === "object" && s.options !== null) {
+                optsObj = s.options as Record<string, unknown>;
+              }
+
+              if (optsObj !== null) {
+                s.method = typeof optsObj.method === "string"
+                  ? optsObj.method.toUpperCase()
+                  : (typeof s.method === "string" && s.method ? (s.method as string).toUpperCase() : "POST");
+
+                let cType = (typeof s.content_type === "string" && s.content_type)
+                  ? (s.content_type as string)
+                  : ((typeof optsObj.content_type === "string" && optsObj.content_type)
+                    ? (optsObj.content_type as string)
+                    : ((typeof optsObj.contentType === "string" && optsObj.contentType)
+                      ? (optsObj.contentType as string)
+                      : "application/json"));
+
+                const oldHeaders = optsObj.headers;
+                if (oldHeaders instanceof Headers) {
+                  cType = oldHeaders.get("content-type") || cType;
+                } else if (Array.isArray(oldHeaders)) {
+                  for (const entry of oldHeaders) {
+                    if (Array.isArray(entry) && typeof entry[0] === "string" &&
+                        entry[0].toLowerCase() === "content-type" && typeof entry[1] === "string") {
+                      cType = entry[1];
+                      break;
+                    }
+                  }
+                } else if (typeof oldHeaders === "object" && oldHeaders !== null) {
+                    for (const [k, v] of Object.entries(oldHeaders)) {
+                      if (k.toLowerCase() === "content-type" && typeof v === "string") cType = v;
+                    }
+                }
+                s.content_type = cType;
+
+                const rawBody = optsObj.body;
+                if (typeof rawBody === "string") {
+                  s.body = rawBody;
+                } else if (rawBody !== undefined && rawBody !== null) {
+                  try { s.body = JSON.stringify(rawBody); } catch { s.body = null; }
+                } else {
+                  s.body = null;
+                }
+              } else {
+                s.method = typeof s.method === "string" && s.method ? (s.method as string).toUpperCase() : "POST";
+                s.content_type = typeof s.content_type === "string" && s.content_type ? s.content_type : "application/json";
+              }
+
+              if ("options" in s) {
+                delete s.options;
+              }
+            }),
+        ]);
+      });
+
+    this.version(3)
+      .stores({
+        questions: "[id+_owner_id], id, _owner_id, institution_code, year, area, subtema",
+        flashcards: "[id+_owner_id], id, _owner_id, question_id, next_review_date",
+        syncQueue: "id, owner_id, status, next_retry_at, created_at",
+      })
+      .upgrade((trans) => {
+        return trans.table("syncQueue").toCollection().modify((s: Record<string, unknown>) => {
+          // If upgrading from v2, fix double-serialized body
+          if (typeof s.body === "string" && s.body.startsWith('"') && s.body.endsWith('"')) {
+            try {
+              const parsed = JSON.parse(s.body);
+              if (typeof parsed === "string") {
+                try {
+                  const innerParsed = JSON.parse(parsed);
+                  if (typeof innerParsed === "object" && innerParsed !== null) {
+                    s.body = parsed;
+                  }
+                } catch {
+                  // The inner string is not a valid JSON object/array, so it was not double-serialized
+                }
+              }
+            } catch {
+              // ignore
+            }
+          }
+        });
+      });
+
+    this.version(4)
+      .stores({
+        questions: "[id+_owner_id], id, _owner_id, institution_code, year, area, subtema",
+        flashcards: "[id+_owner_id], id, _owner_id, question_id, next_review_date",
+        syncQueue: "id, owner_id, status, next_retry_at, created_at",
+        simuladoPackages: "id, owner_id, status, expires_at, created_at",
+      });
+
+    this.version(5)
+      .stores({
+        questions: "[id+_owner_id], id, _owner_id, institution_code, year, area, subtema",
+        flashcards: null,
+        syncQueue: "id, owner_id, status, next_retry_at, created_at",
+        simuladoPackages: "id, owner_id, status, expires_at, created_at",
+      });
+  }
+
+  /**
+   * Purga atomicamente pacotes de simulado expirados da tabela simuladoPackages,
+   * liberando espaço no IndexedDB em cenários de saturação ou QuotaExceededError.
+   * Considera expirados registros com expires_at < now ou status === 'expired'.
+   *
+   * @param now Timestamp de referência opcional (padrão Date.now())
+   * @returns Quantidade de pacotes removidos
+   */
+  async purgeExpiredSimuladoPackages(now: number = Date.now()): Promise<number> {
+    if (!this.simuladoPackages) {
+      return 0;
+    }
+
+    try {
+      return await this.transaction("rw", this.simuladoPackages, async () => {
+        let expiredIds: string[] = [];
+
+        if (typeof this.simuladoPackages.where === "function") {
+          const [byTimeIds, byStatusIds] = await Promise.all([
+            this.simuladoPackages.where("expires_at").between(1, now, true, true).primaryKeys(),
+            this.simuladoPackages.where("status").equals("expired").primaryKeys(),
+          ]);
+          expiredIds = Array.from(new Set([...byTimeIds, ...byStatusIds])).filter(Boolean) as string[];
+        } else if (typeof this.simuladoPackages.toArray === "function") {
+          const allPkgs = (await this.simuladoPackages.toArray()) as Array<{ id: string; status?: string; expires_at?: number }>;
+          expiredIds = allPkgs
+            .filter((p) => p.status === "expired" || (typeof p.expires_at === "number" && p.expires_at > 0 && p.expires_at <= now))
+            .map((p) => p.id)
+            .filter(Boolean);
+        }
+
+        if (expiredIds.length > 0) {
+          await this.simuladoPackages.bulkDelete(expiredIds);
+          if (typeof window !== "undefined" && typeof window.dispatchEvent === "function") {
+            try {
+              window.dispatchEvent(
+                new CustomEvent("simulado-packages-purged", {
+                  detail: { count: expiredIds.length, ids: expiredIds },
+                })
+              );
+            } catch {
+              // Silencia erros de dispatch em ambientes restritos/testes
+            }
+          }
+        }
+
+        return expiredIds.length;
+      });
+    } catch (err) {
+      console.error("[MedQuestDB] Erro ao expurgar pacotes de simulado expirados:", err);
+      throw err;
+    }
+  }
+
+  /**
+   * Sincroniza em lote uma lista de questões com o cache do Dexie de forma transacional e atômica.
+   * Aplica validação estrutural defensiva (IDs numéricos válidos e integridade de formato),
+   * recuperação de quota com evicção atômica de pacotes expirados de simuladoPackages
+   * e rollback completo via transação Dexie caso ocorra qualquer falha irrecuperável de persistência.
+   *
+   * @param questions Lista de questões detalhadas para cache local
+   * @param explicitOwnerId Identificador explícito do proprietário (opcional, fallback para getLocalOwnerId())
+   * @returns Quantidade de questões persistidas com sucesso
+   */
+  async syncQuestions(
+    questions: (QuestionDetail & { _owner_id?: string })[],
+    explicitOwnerId?: string
+  ): Promise<number> {
+    if (!questions || !Array.isArray(questions) || questions.length === 0) {
+      return 0;
+    }
+
+    const ownerId = explicitOwnerId || getLocalOwnerId();
+
+    // 1. Validação defensiva pré-transacional contra dados corrompidos ou malformados
+    const preparedQuestions = questions.map((q, idx) => {
+      if (!q || typeof q !== "object") {
+        throw new Error(`[MedQuestDB] Questão inválida no índice ${idx}: registro não é um objeto.`);
+      }
+      if (typeof q.id !== "number" || isNaN(q.id) || q.id <= 0) {
+        throw new Error(`[MedQuestDB] Questão inválida no índice ${idx}: ID numérico positivo obrigatório.`);
+      }
+      return {
+        ...q,
+        _owner_id: ownerId,
+      };
+    });
+
+    // 2. Execução atômica dentro de transação de leitura/escrita com rollback automático e recuperação de quota
+    try {
+      return await this.transaction("rw", this.questions, async () => {
+        await this.questions.bulkPut(preparedQuestions);
+        return preparedQuestions.length;
+      });
+    } catch (err) {
+      if (isQuotaExceededError(err)) {
+        console.warn("[MedQuestDB] Cota de armazenamento excedida (QuotaExceededError). Executando evicção atômica de pacotes expirados...");
+        let purgedCount = 0;
+        try {
+          purgedCount = await this.purgeExpiredSimuladoPackages();
+        } catch (purgeErr) {
+          console.error("[MedQuestDB] Falha durante purga de pacotes expirados em QuotaExceededError:", purgeErr);
+        }
+
+        if (purgedCount > 0) {
+          console.warn(`[MedQuestDB] ${purgedCount} pacote(s) expirado(s) purgado(s). Retentando persistência de questões...`);
+          try {
+            return await this.transaction("rw", this.questions, async () => {
+              await this.questions.bulkPut(preparedQuestions);
+              return preparedQuestions.length;
+            });
+          } catch (retryErr) {
+            console.error("[MedQuestDB] Falha na retentativa de gravação após purga de cota:", retryErr);
+            throw retryErr;
+          }
+        }
+      }
+
+      console.error("[MedQuestDB] Falha na sincronização transacional de questões (rollback acionado):", err);
+      throw err;
+    }
+  }
+
+  /**
+   * Consulta rapidamente em lote quais IDs de questão já estão cacheados no Dexie para o proprietário.
+   */
+  async getCachedQuestionIds(
+    ids: number[],
+    explicitOwnerId?: string
+  ): Promise<Set<number>> {
+    if (!ids || !Array.isArray(ids) || ids.length === 0) {
+      return new Set();
+    }
+    const ownerId = explicitOwnerId || getLocalOwnerId();
+    try {
+      const keys: [number, string][] = ids.map((id) => [id, ownerId]);
+      const cachedList = await this.questions.bulkGet(keys);
+      const found = new Set<number>();
+      cachedList.forEach((q) => {
+        if (q && typeof q.id === "number") found.add(q.id);
+      });
+      return found;
+    } catch (err) {
+      console.warn("[MedQuestDB] Erro ao consultar IDs cacheados:", err);
+      return new Set();
+    }
+  }
+}
+
+export const localDb = typeof window !== "undefined" ? new MedQuestDB() : (null as unknown as MedQuestDB);
+
+if (typeof window !== "undefined" && localDb && process.env.NODE_ENV !== "production") {
+  (window as unknown as { localDb?: MedQuestDB }).localDb = localDb;
+}
+
+/**
+ * Utilitário de alto nível para sincronizar questões no Dexie com rollback transacional.
+ * Retorna 0 quando executado fora do navegador ou caso localDb não esteja instanciado.
+ */
+export async function syncQuestions(
+  questions: (QuestionDetail & { _owner_id?: string })[],
+  explicitOwnerId?: string
+): Promise<number> {
+  if (typeof window === "undefined" || !localDb) {
+    return 0;
+  }
+  return localDb.syncQuestions(questions, explicitOwnerId);
+}
+
+/**
+ * Utilitário de alto nível para consultar em lote quais IDs já constam em cache local.
+ * Retorna Set vazio fora do navegador ou caso localDb não esteja instanciado.
+ */
+export async function getCachedQuestionIds(
+  ids: number[],
+  explicitOwnerId?: string
+): Promise<Set<number>> {
+  if (typeof window === "undefined" || !localDb) {
+    return new Set();
+  }
+  return localDb.getCachedQuestionIds(ids, explicitOwnerId);
+}
+
+/**
+ * Utilitário de alto nível para purgar pacotes de simulado expirados no Dexie.
+ * Retorna 0 quando executado fora do navegador ou caso localDb não esteja instanciado.
+ */
+export async function purgeExpiredSimuladoPackages(now?: number): Promise<number> {
+  if (typeof window === "undefined" || !localDb) {
+    return 0;
+  }
+  return localDb.purgeExpiredSimuladoPackages(now);
+}
+
+export const FORCED_OFFLINE_STORAGE_KEY = "medquest_force_offline";
+
+export function isForcedOffline(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    return localStorage.getItem(FORCED_OFFLINE_STORAGE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+export function setForcedOffline(enabled: boolean): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (enabled) {
+      localStorage.setItem(FORCED_OFFLINE_STORAGE_KEY, "true");
+    } else {
+      localStorage.removeItem(FORCED_OFFLINE_STORAGE_KEY);
+    }
+    import("./crossTab").then(({ broadcastCrossTab }) => {
+      broadcastCrossTab("forced-offline-changed", { forced: enabled });
+    }).catch(() => {
+      window.dispatchEvent(new CustomEvent("forced-offline-changed", { detail: { forced: enabled } }));
+    });
+  } catch (err) {
+    console.warn("Erro ao salvar status de modo plantão forçado:", err);
+  }
+}
+
+export function isDeviceOffline(): boolean {
+  if (typeof window === "undefined") return false;
+  if (isForcedOffline()) return true;
+  return typeof navigator !== "undefined" && !navigator.onLine;
+}

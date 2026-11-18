@@ -1,0 +1,17 @@
+flask
+flask-cors
+pydantic
+pdfplumber
+pymupdf
+python-dotenv
+libsql==0.1.11
+PyJWT>=2.8
+cryptography
+requests
+gunicorn
+fsrs
+pywebpush
+pytest
+pytest-cov
+rapidfuzz
+tenacity

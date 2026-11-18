@@ -1,0 +1,74 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { defineConfig, devices } from '@playwright/test';
+
+for (const envFile of ['.env.local', '.env']) {
+  const fullPath = path.join(process.cwd(), envFile);
+  if (fs.existsSync(fullPath)) {
+    const content = fs.readFileSync(fullPath, 'utf8');
+    for (const line of content.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eqIndex = trimmed.indexOf('=');
+      if (eqIndex > 0) {
+        const key = trimmed.slice(0, eqIndex).trim();
+        const rawVal = trimmed.slice(eqIndex + 1).trim();
+        if (!(key in process.env)) {
+          process.env[key] = rawVal.replace(/^(['"])(.*)\1$/, '$2');
+        }
+      }
+    }
+  }
+}
+
+const baseURL = process.env.PLAYWRIGHT_BASE_URL || 'http://127.0.0.1:3100';
+const testServerPort = new URL(baseURL).port || '3100';
+
+export default defineConfig({
+  testDir: './e2e',
+  fullyParallel: false,
+  forbidOnly: !!process.env.CI,
+  retries: 0,
+  workers: 1,
+  reporter: 'list',
+  timeout: 30000,
+  use: {
+    baseURL,
+    // Every browser flow in this suite uses the demo account with mocked APIs.
+    // Match the configured host instead of relying on localhost-only cookies.
+    storageState: { cookies: ['medquest_demo', '__clerk_db_jwt'].map(name => ({
+      name, value: name === 'medquest_demo' ? '1' : 'test',
+      domain: new URL(baseURL).hostname, path: '/', expires: -1,
+      httpOnly: false, secure: false, sameSite: 'Lax' as const })), origins: [] },
+    trace: 'off',
+  },
+  projects: [
+    {
+      name: 'chromium',
+      use: { ...devices['Desktop Chrome'] },
+    },
+  ],
+  webServer: {
+    command: 'node .next/standalone/server.js',
+    env: {
+      PORT: testServerPort,
+      HOSTNAME: '0.0.0.0',
+      FLASK_API_URL: 'http://127.0.0.1:9999',
+      FLASK_API_PROXY_SECRET: 'test-proxy-secret',
+      PLAYWRIGHT_TEST: 'true',
+      // Chave de teste sintática do domínio clerk.example.com; evita que o
+      // middleware do Clerk rejeite o ambiente E2E antes dos mocks de rota.
+      NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || 'pk_test_Y2xlcmsuZXhhbXBsZS5jb20k',
+      CLERK_SECRET_KEY: process.env.CLERK_SECRET_KEY || 'sk_test_mock',
+    },
+    // The app shell may depend on an external API, so use a static asset as
+    // the readiness probe. Browser requests are mocked by the E2E suite.
+    url: `${baseURL}/favicon.ico`,
+    reuseExistingServer: !process.env.CI,
+    timeout: 120000,
+
+
+
+
+  },
+});

@@ -1,0 +1,190 @@
+"use client";
+
+import React, { useEffect, useState } from "react";
+import Link from "next/link";
+import { usePathname, useRouter } from "next/navigation";
+import { useQueryClient } from "@tanstack/react-query";
+import { prefetchRouteIntent } from "@/lib/queries/prefetchRouteData";
+import clsx from "clsx";
+import {
+  Menu as MenuIcon,
+  X,
+  CloudOff,
+  CloudDownload,
+  Maximize2,
+  Minimize2,
+} from "lucide-react";
+import { useZenMode } from "@/hooks/useZenMode";
+import { ThemeToggle } from "./ThemeToggle";
+import { OfflineModal } from "./OfflineModal";
+import { AccountModal } from "./AccountModal";
+import { useOfflineStatus } from "@/lib/useOfflineStatus";
+import {
+  PRIMARY_BOTTOM_NAV_ITEMS,
+  MORE_BOTTOM_NAV_ITEMS,
+} from "@/lib/navigation";
+import { ClinicalIcon } from "@/components/ui/ClinicalIcon";
+
+export function BottomNav() {
+  const pathname = usePathname();
+  const router = useRouter();
+  const queryClient = useQueryClient();
+  const [isMoreOpen, setIsMoreOpen] = useState(false);
+  const [isOfflineOpen, setIsOfflineOpen] = useState(false);
+  const [isAccountOpen, setIsAccountOpen] = useState(false);
+  const { isZenMode, toggleZenMode } = useZenMode();
+  const { isOffline, forcedOffline } = useOfflineStatus();
+
+  useEffect(() => {
+    if (!isMoreOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setIsMoreOpen(false);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [isMoreOpen]);
+
+  return (
+    <>
+      {/* DRAWER "MAIS" PARA ROTAS COMPLEMENTARES NO MOBILE */}
+      {isMoreOpen && (
+        <div
+          className="fixed inset-0 bg-black/60 backdrop-blur-xs z-40 md:hidden animate-in fade-in duration-150"
+          onClick={() => setIsMoreOpen(false)}
+        />
+      )}
+
+      {isMoreOpen && (
+        <aside
+          role="dialog"
+          aria-modal="true"
+          aria-label="Menu complementar"
+          className="fixed bottom-16 left-0 right-0 max-h-[70dvh] bg-surface border-t border-line-subtle z-50 md:hidden flex flex-col shadow-xl animate-in slide-in-from-bottom duration-200"
+        >
+          <div className="flex items-center justify-between p-3.5 border-b border-line-subtle">
+            <span className="text-xs font-mono-lab font-bold uppercase tracking-wider text-ink-secondary">
+              Navegação Completa
+            </span>
+            <button
+              type="button"
+              onClick={() => setIsMoreOpen(false)}
+              className="min-w-[38px] min-h-[38px] flex items-center justify-center rounded text-ink-muted hover:text-ink-primary hover:bg-elevated cursor-pointer"
+              aria-label="Fechar"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+
+          <div className="overflow-y-auto p-2 space-y-1">
+            {MORE_BOTTOM_NAV_ITEMS.map((item) => {
+              const isActive = pathname === item.href;
+              return (
+                <Link
+                  key={item.href}
+                  href={item.href}
+                  onTouchStart={() => prefetchRouteIntent(item.href, router, queryClient)}
+                  onFocus={() => prefetchRouteIntent(item.href, router, queryClient)}
+                  onClick={() => setIsMoreOpen(false)}
+                  className={clsx(
+                    "flex items-center gap-3 px-3 py-2.5 min-h-[40px] rounded-sm text-xs font-medium transition-colors",
+                    isActive
+                      ? "bg-elevated text-accent font-semibold border-l-2 border-accent"
+                      : "text-ink-secondary hover:bg-elevated hover:text-ink-primary"
+                  )}
+                >
+                  <ClinicalIcon name={item.icon} className="w-4 h-4 shrink-0" strokeWidth={1.8} />
+                  <span>{item.label}</span>
+                </Link>
+              );
+            })}
+          </div>
+
+          <div className="p-3 border-t border-line-subtle flex items-center justify-between gap-2 bg-elevated/50">
+            <div className="flex items-center gap-2">
+              <ThemeToggle />
+              <button
+                type="button"
+                onClick={toggleZenMode}
+                aria-pressed={isZenMode}
+                className="flex items-center gap-1 min-h-[38px] px-3 py-1.5 rounded-xs border border-line-subtle text-[11px] font-mono-lab text-ink-secondary hover:text-ink-primary cursor-pointer"
+              >
+                {isZenMode ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
+                <span>{isZenMode ? "Sair Zen" : "Zen"}</span>
+              </button>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => {
+                setIsMoreOpen(false);
+                setIsOfflineOpen(true);
+              }}
+              className={clsx(
+                "flex items-center gap-1.5 min-h-[38px] px-3 py-1.5 rounded-xs border text-[11px] font-mono-lab font-semibold cursor-pointer",
+                isOffline || forcedOffline
+                  ? "bg-warning/15 border-warning/40 text-warning"
+                  : "border-line-subtle text-ink-secondary hover:text-ink-primary"
+              )}
+            >
+              {isOffline || forcedOffline ? <CloudOff className="w-3.5 h-3.5" /> : <CloudDownload className="w-3.5 h-3.5" />}
+              <span>Plantão</span>
+            </button>
+          </div>
+        </aside>
+      )}
+
+      {/* BARRA FIXA DE POLEGAR INFERIOR (THUMB-ZONE) */}
+      <nav
+        aria-label="Navegação móvel"
+        className="fixed bottom-0 left-0 right-0 z-30 md:hidden bg-surface/95 backdrop-blur-md border-t border-line-subtle pb-[env(safe-area-inset-bottom,0px)] shadow-lg"
+      >
+        <div className="flex items-center justify-around h-14 px-1 max-w-lg mx-auto">
+          {PRIMARY_BOTTOM_NAV_ITEMS.map((item) => {
+            const isActive = pathname === item.href;
+            return (
+              <Link
+                key={item.href}
+                href={item.href}
+                onTouchStart={() => prefetchRouteIntent(item.href, router, queryClient)}
+                onFocus={() => prefetchRouteIntent(item.href, router, queryClient)}
+                className={clsx(
+                  "flex flex-col items-center justify-center flex-1 h-full py-1 gap-0.5 text-[10px] font-medium transition-colors relative",
+                  isActive
+                    ? "text-accent font-semibold"
+                    : "text-ink-muted hover:text-ink-primary"
+                )}
+              >
+                {isActive && (
+                  <span className="absolute top-0 w-8 h-0.5 bg-accent rounded-full" />
+                )}
+                <ClinicalIcon name={item.icon} className="w-4 h-4" strokeWidth={isActive ? 2.2 : 1.75} />
+                <span className="tracking-tight">{item.bottomLabel || item.label}</span>
+              </Link>
+            );
+          })}
+
+          {/* BOTÃO MAIS */}
+          <button
+            onClick={() => setIsMoreOpen(!isMoreOpen)}
+            className={clsx(
+              "flex flex-col items-center justify-center flex-1 h-full py-1 gap-0.5 text-[10px] font-medium transition-colors cursor-pointer",
+              isMoreOpen || MORE_BOTTOM_NAV_ITEMS.some((i) => i.href === pathname)
+                ? "text-accent font-semibold"
+                : "text-ink-muted hover:text-ink-primary"
+            )}
+            aria-label="Mais opções"
+            aria-expanded={isMoreOpen}
+          >
+            <MenuIcon className="w-4 h-4" strokeWidth={1.75} />
+            <span className="tracking-tight">Mais</span>
+          </button>
+        </div>
+      </nav>
+
+      <OfflineModal isOpen={isOfflineOpen} onClose={() => setIsOfflineOpen(false)} />
+      <AccountModal isOpen={isAccountOpen} onClose={() => setIsAccountOpen(false)} />
+    </>
+  );
+}

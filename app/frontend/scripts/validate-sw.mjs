@@ -1,0 +1,83 @@
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const swPath = path.resolve(__dirname, "../public/sw.js");
+const manifestPath = path.resolve(__dirname, "../public/manifest.json");
+const requiredIconPaths = [
+  path.resolve(__dirname, "../public/icon-192x192.png"),
+  path.resolve(__dirname, "../public/icon-512x512.png"),
+];
+
+console.log("[SW Validator] Verifying Service Worker security rules in:", swPath);
+
+let hasErrors = false;
+
+if (!fs.existsSync(swPath)) {
+  console.error("[SW Validator ERROR] public/sw.js does not exist!");
+  process.exit(1);
+}
+
+if (!fs.existsSync(manifestPath)) {
+  console.error("[SW Validator ERROR] public/manifest.json does not exist!");
+  process.exit(1);
+}
+
+for (const iconPath of requiredIconPaths) {
+  if (!fs.existsSync(iconPath) || fs.statSync(iconPath).size === 0) {
+    console.error(`[SW Validator ERROR] Required PWA icon is missing or empty: ${iconPath}`);
+    hasErrors = true;
+  }
+}
+
+const swContent = fs.readFileSync(swPath, "utf-8");
+
+// 1. Forbidden caches that store user data, HTML or API responses
+const forbiddenPatterns = [
+  { pattern: /cacheName:\s*["']apis["']/, name: 'cacheName:"apis"' },
+  { pattern: /cacheName:\s*["']pages["']/, name: 'cacheName:"pages"' },
+  { pattern: /cacheName:\s*["']pages-rsc["']/, name: 'cacheName:"pages-rsc"' },
+  { pattern: /cacheName:\s*["']pages-rsc-prefetch["']/, name: 'cacheName:"pages-rsc-prefetch"' },
+  { pattern: /cacheName:\s*["']start-url["']/, name: 'cacheName:"start-url"' },
+];
+
+for (const { pattern, name } of forbiddenPatterns) {
+  if (pattern.test(swContent)) {
+    console.error(`[SW Validator ERROR] Security violation: Found forbidden cache ${name} in sw.js!`);
+    hasErrors = true;
+  }
+}
+
+// 2. Required cache rule: medquest-image-cache for /api/images/**
+if (!swContent.includes("medquest-image-cache")) {
+  console.error("[SW Validator ERROR] Required rule 'medquest-image-cache' for images is missing in sw.js!");
+  hasErrors = true;
+}
+
+// 3. Required handler: NetworkOnly for /api/**
+if (!swContent.includes("NetworkOnly")) {
+  console.error("[SW Validator ERROR] Required handler 'NetworkOnly' for APIs is missing in sw.js!");
+  hasErrors = true;
+}
+
+// 4. The PWA may cache exactly one navigation shell for /estudar. The
+// questions themselves remain owner-scoped in IndexedDB, never in Workbox.
+if (!swContent.includes("medquest-study-shell")) {
+  console.error("[SW Validator ERROR] Offline study shell cache is missing in sw.js!");
+  hasErrors = true;
+}
+
+if (hasErrors) {
+  console.error("[SW Validator FAILED] Service Worker contains invalid or insecure caching configuration.");
+  process.exit(1);
+}
+
+console.log("[SW Validator PASSED] Service Worker is verified safe:");
+console.log(" - No API or broad page-data caches found.");
+console.log(" - medquest-image-cache present.");
+console.log(" - NetworkOnly for /api/** present.");
+console.log(" - Offline shell for /estudar present.");
+console.log(" - Manifest bitmap icons present.");
+process.exit(0);

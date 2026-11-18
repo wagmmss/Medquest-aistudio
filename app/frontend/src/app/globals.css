@@ -1,0 +1,502 @@
+@import "tailwindcss";
+
+/* Dark mode por classe .dark no <html> (padrão shadcn/Tailwind v4) */
+@variant dark (&:where(.dark, .dark *));
+
+@theme inline {
+  --color-on-surface-variant: var(--on-surface-variant);
+  --color-primary-fixed: var(--primary-fixed);
+  --color-secondary: var(--secondary);
+  --color-on-tertiary-fixed: var(--on-tertiary-fixed);
+  --color-background: var(--background);
+  --color-primary-fixed-dim: var(--primary-fixed-dim);
+  --color-secondary-container: var(--secondary-container);
+  --color-tertiary-fixed: var(--tertiary-fixed);
+  --color-on-secondary-container: var(--on-secondary-container);
+  --color-on-error: var(--on-error);
+  --color-secondary-fixed-dim: var(--secondary-fixed-dim);
+  --color-error-container: var(--error-container);
+  --color-error: var(--error);
+  --color-surface-variant: var(--surface-variant);
+  --color-surface-container: var(--surface-container);
+  --color-primary-container: var(--primary-container);
+  --color-on-secondary-fixed: var(--on-secondary-fixed);
+  --color-outline-variant: var(--outline-variant);
+  --color-inverse-primary: var(--inverse-primary);
+  --color-surface-dim: var(--surface-dim);
+  --color-on-primary-fixed: var(--on-primary-fixed);
+  --color-on-background: var(--on-background);
+  --color-primary: var(--primary);
+  --color-inverse-surface: var(--inverse-surface);
+  --color-on-primary: var(--on-primary);
+  --color-surface-container-highest: var(--surface-container-highest);
+  --color-surface-bright: var(--surface-bright);
+  --color-inverse-on-surface: var(--inverse-on-surface);
+  --color-on-error-container: var(--on-error-container);
+  --color-secondary-fixed: var(--secondary-fixed);
+  --color-on-tertiary-fixed-variant: var(--on-tertiary-fixed-variant);
+  --color-on-secondary: var(--on-secondary);
+  --color-outline: var(--outline);
+  --color-on-primary-fixed-variant: var(--on-primary-fixed-variant);
+  --color-surface: var(--surface);
+  --color-on-surface: var(--on-surface);
+  --color-on-secondary-fixed-variant: var(--on-secondary-fixed-variant);
+  --color-surface-container-low: var(--surface-container-low);
+  --color-on-tertiary-container: var(--on-tertiary-container);
+  --color-surface-tint: var(--surface-tint);
+  --color-surface-container-high: var(--surface-container-high);
+  --color-on-tertiary: var(--on-tertiary);
+  --color-surface-container-lowest: var(--surface-container-lowest);
+  --color-tertiary-fixed-dim: var(--tertiary-fixed-dim);
+  --color-on-primary-container: var(--on-primary-container);
+  --color-tertiary: var(--tertiary);
+  --color-tertiary-container: var(--tertiary-container);
+
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-card-2: var(--card-2);
+  --color-border: var(--border);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-primary-foreground: var(--primary-foreground);
+
+  /* Clinical Precision Workspace Tokens */
+  --color-canvas: var(--bg-canvas);
+  --color-surface: var(--bg-surface);
+  --color-surface-subtle: var(--bg-surface-subtle);
+  --color-elevated: var(--bg-elevated);
+  --color-popover: var(--bg-popover);
+  --color-popover-foreground: var(--ink-primary);
+  --color-ink: var(--ink-primary);
+  --color-ink-primary: var(--ink-primary);
+  --color-ink-secondary: var(--ink-secondary);
+  --color-ink-muted: var(--ink-muted);
+  --color-line-subtle: var(--line-subtle);
+  --color-line-strong: var(--line-strong);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-fg: var(--accent-fg);
+  --color-critical: var(--critical);
+  --color-critical-bg: var(--critical-bg);
+  --color-warning-bg: var(--warning-bg);
+  --color-normal: var(--normal);
+  --color-normal-bg: var(--normal-bg);
+  --color-info: var(--info);
+  --color-info-bg: var(--info-bg);
+  --color-area-clinica: var(--area-clinica);
+  --color-area-cirurgia: var(--area-cirurgia);
+  --color-area-go: var(--area-go);
+  --color-area-pediatria: var(--area-pediatria);
+  --color-area-preventiva: var(--area-preventiva);
+
+  --font-mono-lab: var(--font-mono-lab), "JetBrains Mono", monospace;
+  --font-sans-clinical: var(--font-sans-clinical), "Inter", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  --font-display: var(--font-display), "Plus Jakarta Sans", "Inter", system-ui, sans-serif;
+
+  --radius-xs: 6px;
+  --radius-sm: 10px;
+  --radius-md: 14px;
+
+  --radius: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+  --radius-full: 9999px;
+
+  --spacing-margin: 32px;
+  --spacing-unit: 4px;
+  --spacing-gutter: 24px;
+  --spacing-stack-md: 16px;
+  --spacing-stack-sm: 8px;
+  --spacing-stack-lg: 32px;
+
+  --font-body-sm: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-body-md: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-headline-lg-mobile: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-headline-md: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-headline-lg: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-display-lg: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-label-md: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-body-lg: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+}
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+    max-width: 100vw;
+    overflow-x: hidden;
+  }
+  body {
+    max-width: 100vw;
+    overflow-x: hidden;
+    background-color: var(--color-background);
+    color: var(--color-on-background);
+    font-family: var(--font-sans-clinical);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  h1, h2, h3, h4 {
+    font-family: var(--font-display);
+    letter-spacing: -0.02em;
+  }
+
+  :where(a, button, input, select, textarea, [role="button"]):focus-visible {
+    outline: 3px solid var(--color-primary);
+    outline-offset: 3px;
+  }
+
+  :where(button, [role="button"], input[type="checkbox"], input[type="radio"]) {
+    touch-action: manipulation;
+  }
+}
+
+.skip-link {
+  position: fixed;
+  top: 0.75rem;
+  left: 0.75rem;
+  z-index: 100;
+  transform: translateY(-180%);
+  border-radius: 0.75rem;
+  background: var(--color-primary);
+  color: var(--color-primary-foreground);
+  padding: 0.75rem 1rem;
+  font-weight: 700;
+  transition: transform 150ms ease;
+}
+
+.skip-link:focus {
+  transform: translateY(0);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@media (forced-colors: active) {
+  :where(a, button, input, select, textarea) { border-color: ButtonText; }
+}
+
+/* Transição suave para menus */
+.app-sidebar, .app-top-nav {
+  transition: opacity 0.4s ease-in-out, visibility 0.4s ease-in-out;
+}
+
+/* Modo Zen - Oculta menus laterais e cabeçalho, expandindo a área de estudo */
+body.zen-mode .app-sidebar,
+body.zen-mode .app-top-nav {
+  opacity: 0 !important;
+  visibility: hidden !important;
+  pointer-events: none !important;
+}
+body.zen-mode main {
+  max-width: 100% !important;
+  width: 100vw !important;
+  margin: 0 !important;
+  padding: 1.5rem !important;
+}
+body.zen-mode > div:first-of-type {
+  width: 100vw !important;
+}
+
+/* Utilitários tipográficos específicos do Clinical Precision que requerem propriedades extras além de font-size */
+@utility text-body-sm {
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 400;
+}
+@utility font-body-sm { font-family: var(--font-body-sm); }
+
+@utility text-body-md {
+  font-size: 16px;
+  line-height: 24px;
+  font-weight: 400;
+}
+@utility font-body-md { font-family: var(--font-body-md); }
+
+@utility text-headline-lg-mobile {
+  font-size: 24px;
+  line-height: 32px;
+  font-weight: 600;
+}
+@utility font-headline-lg-mobile { font-family: var(--font-headline-lg-mobile); }
+
+@utility text-headline-md {
+  font-size: 24px;
+  line-height: 32px;
+  font-weight: 600;
+}
+@utility font-headline-md { font-family: var(--font-headline-md); }
+
+@utility text-headline-lg {
+  font-size: 32px;
+  line-height: 40px;
+  letter-spacing: -0.01em;
+  font-weight: 600;
+}
+@utility font-headline-lg { font-family: var(--font-headline-lg); }
+
+@utility text-display-lg {
+  font-size: 48px;
+  line-height: 56px;
+  letter-spacing: -0.02em;
+  font-weight: 700;
+}
+@utility font-display-lg { font-family: var(--font-display-lg); }
+
+@utility text-label-md {
+  font-size: 12px;
+  line-height: 16px;
+  letter-spacing: 0.05em;
+  font-weight: 600;
+}
+@utility font-label-md { font-family: var(--font-label-md); }
+
+@utility text-body-lg {
+  font-size: 18px;
+  line-height: 28px;
+  font-weight: 400;
+}
+@utility font-body-lg { font-family: var(--font-body-lg); }
+
+:root {
+  /* Clinical Calm: Papel Fosco Médio (conforto em leitura prolongada) */
+  --bg-canvas: #dce3ec;
+  --bg-surface: #eaeff5;
+  --bg-surface-subtle: #e2e8f1;
+  --bg-elevated: #d2dbe6;
+  --bg-popover: #f0f4f8;
+  --ink-primary: #142238;
+  --ink-secondary: #435164;
+  --ink-muted: #5d6c80;
+  --line-subtle: #c5d0de;
+  --line-strong: #a7b6c8;
+  --accent: #0f9d9a;
+  --accent-hover: #0b827f;
+  --accent-fg: #f8fafc;
+  --critical: #e11d48;
+  --critical-bg: #fce7ec;
+  --warning: #d97706;
+  --warning-bg: #fef3c7;
+  --normal: #059669;
+  --normal-bg: #d1fae5;
+  --info: #0284c7;
+  --info-bg: #e0f2fe;
+  --area-clinica: #0f766e;
+  --area-cirurgia: #0284c7;
+  --area-go: #be185d;
+  --area-pediatria: #d97706;
+  --area-preventiva: #4f46e5;
+
+  --background: var(--bg-canvas);
+  --on-background: var(--ink-primary);
+  --surface: var(--bg-surface);
+  --on-surface: var(--ink-primary);
+  
+  /* Primary: Deep Medical Navy */
+  --primary: #0b2a4a;
+  --on-primary: #ffffff;
+  --primary-container: #e2e8f0;
+  --on-primary-container: #0b2a4a;
+  --primary-fixed: #e2e8f0;
+  --on-primary-fixed: #0b2a4a;
+  --primary-fixed-dim: #cbd5e1;
+  --on-primary-fixed-variant: #334155;
+  --inverse-primary: #f8fafc;
+
+  /* Secondary: Soft teal/emerald for medical feel */
+  --secondary: #0d9488;
+  --on-secondary: #ffffff;
+  --secondary-container: #ccfbf1;
+  --on-secondary-container: #115e59;
+  --secondary-fixed: #ccfbf1;
+  --on-secondary-fixed: #115e59;
+  --secondary-fixed-dim: #99f6e4;
+  --on-secondary-fixed-variant: #0f766e;
+
+  /* Tertiary: Subtle accents */
+  --tertiary: #475569;
+  --on-tertiary: #ffffff;
+  --tertiary-container: #f1f5f9;
+  --on-tertiary-container: #334155;
+  --tertiary-fixed: #f1f5f9;
+  --on-tertiary-fixed: #0f172a;
+  --tertiary-fixed-dim: #e2e8f0;
+  --on-tertiary-fixed-variant: #475569;
+
+  /* Surfaces & Containers */
+  --surface-bright: #eaeff5;
+  --surface-dim: #cdd7e3;
+  --surface-container-lowest: #eef2f7;
+  --surface-container-low: #e2e8f0;
+  --surface-container: #eaeff5;
+  --surface-container-high: #d7e0eb;
+  --surface-container-highest: #cbd5e1;
+  --surface-variant: #dde4ee;
+  --on-surface-variant: #435164;
+  --inverse-surface: #1e293b;
+  --inverse-on-surface: #f1f5f9;
+  --surface-tint: #0f172a;
+
+  /* Borders & Outlines */
+  --outline: var(--line-subtle);
+  --outline-variant: var(--line-strong);
+  --border: var(--line-subtle);
+
+  /* Feedback Colors */
+  --error: var(--critical);
+  --on-error: #ffffff;
+  --error-container: var(--critical-bg);
+  --on-error-container: #991b1b;
+  --success: var(--normal);
+  --success-foreground: #ffffff;
+  --destructive: var(--critical);
+  --destructive-foreground: #ffffff;
+  --warning-foreground: #ffffff;
+
+  /* Cards */
+  --card: var(--bg-surface);
+  --card-foreground: var(--ink-primary);
+  --card-2: var(--bg-elevated);
+  --muted: var(--bg-elevated);
+  --muted-foreground: var(--ink-secondary);
+  --primary-foreground: #ffffff;
+}
+
+.dark {
+  color-scheme: dark;
+  /* Clinical Calm Dark: Grafite Neutro Suave (equilíbrio entre OLED e cinza-carvão) */
+  --bg-canvas: #121417;
+  --bg-surface: #191c20;
+  --bg-surface-subtle: #1e2228;
+  --bg-elevated: #22262c;
+  --bg-popover: #1d2127;
+  --ink-primary: #e4e7eb;
+  --ink-secondary: #9ca3af;
+  --ink-muted: #6b7280;
+  --line-subtle: #282c33;
+  --line-strong: #373d47;
+  --accent: #2dd4bf;
+  --accent-hover: #5eead4;
+  --accent-fg: #0e1013;
+  --critical: #fb7185;
+  --critical-bg: #2f1720;
+  --warning: #fbbf24;
+  --warning-bg: #2e2412;
+  --normal: #34d399;
+  --normal-bg: #112b22;
+  --info: #38bdf8;
+  --info-bg: #122838;
+  --area-clinica: #2dd4bf;
+  --area-cirurgia: #38bdf8;
+  --area-go: #f472b6;
+  --area-pediatria: #fbbf24;
+  --area-preventiva: #818cf8;
+
+  --background: var(--bg-canvas);
+  --on-background: var(--ink-primary);
+  --surface: var(--bg-surface);
+  --on-surface: var(--ink-primary);
+  
+  --primary: #e4e7eb;
+  --on-primary: #121417;
+  --primary-container: #22262c;
+  --on-primary-container: #e4e7eb;
+  --primary-fixed: #22262c;
+  --on-primary-fixed: #e4e7eb;
+  --primary-fixed-dim: #323740;
+  --on-primary-fixed-variant: #cbd2d9;
+  --inverse-primary: #121417;
+
+  --secondary: #2dd4bf;
+  --on-secondary: #0e1013;
+  --secondary-container: #134e4a;
+  --on-secondary-container: #ccfbf1;
+  --secondary-fixed: #115e59;
+  --on-secondary-fixed: #ccfbf1;
+  --secondary-fixed-dim: #134e4a;
+  --on-secondary-fixed-variant: #5eead4;
+
+  --tertiary: #9ca3af;
+  --on-tertiary: #121417;
+  --tertiary-container: #22262c;
+  --on-tertiary-container: #e4e7eb;
+  --tertiary-fixed: #22262c;
+  --on-tertiary-fixed: #e4e7eb;
+  --tertiary-fixed-dim: #323740;
+  --on-tertiary-fixed-variant: #cbd2d9;
+
+  --surface-bright: #22262c;
+  --surface-dim: #0e1013;
+  --surface-container-lowest: #0e1013;
+  --surface-container-low: #15171b;
+  --surface-container: #191c20;
+  --surface-container-high: #22262c;
+  --surface-container-highest: #2b3038;
+  --surface-variant: #1e2127;
+  --on-surface-variant: #9ca3af;
+  --inverse-surface: #e4e7eb;
+  --inverse-on-surface: #121417;
+  --surface-tint: #e4e7eb;
+
+  --outline: var(--line-subtle);
+  --outline-variant: var(--line-strong);
+  --border: var(--line-subtle);
+
+  --error: var(--critical);
+  --on-error: #450a0a;
+  --error-container: var(--critical-bg);
+  --on-error-container: #fecaca;
+  --success: var(--normal);
+  --success-foreground: #064e3b;
+  --destructive: var(--critical);
+  --destructive-foreground: #450a0a;
+  --warning-foreground: #78350f;
+
+  --card: var(--bg-surface);
+  --card-foreground: var(--ink-primary);
+  --card-2: var(--bg-elevated);
+  --muted: var(--bg-elevated);
+  --muted-foreground: var(--ink-secondary);
+  --primary-foreground: #121417;
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--line-strong);
+  border-radius: 2px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--ink-muted);
+}
+
+/* Atmosfera sutil no topo das páginas (Clinical Calm) */
+.mq-page-hero {
+  background: linear-gradient(135deg, rgba(15, 157, 154, 0.11) 0%, rgba(11, 42, 74, 0.05) 55%, var(--bg-surface) 100%);
+  border: 1px solid var(--line-subtle);
+  border-radius: 16px;
+}
+
+.dark .mq-page-hero {
+  background: linear-gradient(135deg, rgba(45, 212, 191, 0.08) 0%, rgba(255, 255, 255, 0.02) 55%, var(--bg-surface) 100%);
+}

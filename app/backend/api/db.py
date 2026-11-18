@@ -1,0 +1,598 @@
+"""Acesso ao banco (SQLite / Turso) e criação/evolução de tabelas."""
+import logging
+import os
+import re
+import sqlite3
+from contextlib import contextmanager
+from threading import local
+
+from dotenv import load_dotenv
+from flask import g
+
+from .migrations import apply_pending_migrations
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB_PATH = os.environ.get("MEDQUEST_DB", os.path.join(BACKEND_DIR, "medquest.db"))
+TURSO_URL = os.environ.get("TURSO_DATABASE_URL")
+TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
+
+# The native libSQL client owns a Rust runtime and must not be shared across
+# request threads. Keep one persistent connection per worker thread instead of
+# constructing/closing a runtime for every Flask request.
+_turso_clients = local()
+
+
+def _connect_turso(turso_url, turso_token):
+    import libsql
+
+    client = getattr(_turso_clients, "client", None)
+    if client is None:
+        # A direct remote connection avoids the full embedded-replica sync at
+        # cold start. Its lifetime is the worker thread, not a request.
+        client = libsql.connect(turso_url, auth_token=turso_token)
+        _turso_clients.client = client
+        logger.info("Connected to remote Turso database directly for worker thread")
+    return client
+
+
+def _is_stale_turso_stream(error):
+    """Whether Turso rejected a request before it could run on an expired stream."""
+    err_str = str(error).lower()
+    stale_patterns = (
+        "stream not found",
+        "stream expired",
+        "expired stream",
+        "stream closed",
+        "closed stream",
+        "baton",
+        "connection reset",
+        "connection closed",
+        "broken pipe",
+        "websocket",
+        "transport error",
+        "hrana",
+        "status 408",
+        "status 502",
+        "status 503",
+        "status=404",
+        "status code 404",
+        "timeout",
+    )
+    return any(p in err_str for p in stale_patterns)
+
+
+def _reconnect_turso(turso_url, turso_token, failed_client=None):
+    """Discard only the current worker's invalid client and open a fresh stream."""
+    curr = getattr(_turso_clients, "client", None)
+    if failed_client is None or curr is failed_client:
+        if hasattr(_turso_clients, "client"):
+            delattr(_turso_clients, "client")
+    if failed_client:
+        try:
+            failed_client.close()
+        except Exception:
+            # The stream is already invalid; closing it is best-effort cleanup.
+            pass
+    return _connect_turso(turso_url, turso_token)
+
+
+_WRITE_KEYWORDS_RE = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|REPLACE|DROP|ALTER|CREATE|ATTACH|DETACH|VACUUM|REINDEX)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_read_only_query(sql):
+    cleaned = (sql or "").strip()
+    upper = cleaned.upper()
+    if not upper.startswith(("SELECT", "WITH", "PRAGMA", "EXPLAIN")):
+        return False
+    # Impede que CTEs com escrita (WITH ... DELETE/UPDATE) sejam tratadas como leitura
+    return _WRITE_KEYWORDS_RE.search(cleaned) is None
+
+
+class TursoRow(dict):
+    """Expose DB-API cursor rows as mappings, matching sqlite3.Row usage."""
+    def __init__(self, mapping, values):
+        super().__init__(mapping)
+        self._values = tuple(values)
+
+    def __getitem__(self, item):
+        if isinstance(item, int):
+            return self._values[item]
+        return super().__getitem__(item)
+
+
+class TursoCursor:
+    """Expose DB-API cursor rows as mappings, matching sqlite3.Row usage."""
+
+    def __init__(self, cursor):
+        self.cursor = cursor
+        self.columns = [column[0] for column in (getattr(cursor, "description", None) or [])]
+        self._lastrowid = getattr(cursor, "lastrowid", None) if cursor else None
+        self._rowcount = getattr(cursor, "rowcount", 0) if cursor else 0
+        self._closed = False
+        # Statements de escrita (sem colunas) são fechados imediatamente
+        if not self.columns:
+            self.close()
+        
+    def fetchone(self):
+        if self.cursor is None:
+            return None
+        row = self.cursor.fetchone()
+        self.close()
+        if row is None:
+            return None
+        return TursoRow(zip(self.columns, row), row)
+        
+    def fetchall(self):
+        if self.cursor is None:
+            return []
+        rows = self.cursor.fetchall()
+        self.close()
+        return [TursoRow(zip(self.columns, row), row) for row in rows]
+
+    def close(self):
+        if getattr(self, '_closed', True):
+            return
+        close_method = getattr(self.cursor, "close", None) if self.cursor else None
+        if callable(close_method):
+            close_method()
+        self._closed = True
+        
+    @property
+    def lastrowid(self):
+        if self._lastrowid is not None:
+            return self._lastrowid
+        return getattr(self.cursor, "lastrowid", None) if self.cursor else None
+
+    @property
+    def rowcount(self):
+        if self._rowcount is not None:
+            return self._rowcount
+        return getattr(self.cursor, "rowcount", 0) if self.cursor else 0
+
+def _sanitize_params(parameters):
+    """Sanitiza parâmetros preservando dicts/sequências sem corromper binários silenciosamente."""
+    if isinstance(parameters, dict):
+        return {
+            k: (v.decode("utf-8", "replace") if isinstance(v, bytes) else v)
+            for k, v in parameters.items()
+        }
+    if isinstance(parameters, (list, tuple)):
+        return [
+            x.decode("utf-8", "replace") if isinstance(x, bytes) else x
+            for x in parameters
+        ]
+    return list(parameters)
+
+
+class TursoConnection:
+    def __init__(self, client, persistent=False, reconnect=None):
+        self.client = client
+        self.tx = False
+        self.persistent = persistent
+        self._reconnect = reconnect
+
+    def _execute_with_reconnect(self, sql, args, retry_stale_stream):
+        try:
+            return self.client.execute(sql, args)
+        except Exception as error:
+            # A 404 "stream not found" or broken stream is produced by Turso before the SQL is
+            # evaluated. It is therefore safe to recreate the client and replay
+            # a single statement, but never while a transaction is in progress:
+            # replaying part of a transaction could duplicate a mutation.
+            if not (retry_stale_stream and self.persistent and self._reconnect and _is_stale_turso_stream(error)):
+                raise
+            logger.warning("Turso stream expired; reconnecting and retrying one statement")
+            self.client = self._reconnect(self.client)
+            return self.client.execute(sql, args)
+        
+    def _executemany_with_reconnect(self, sql, seq_of_args, retry_stale_stream):
+        def _dispatch(target):
+            if hasattr(target, "executemany"):
+                return target.executemany(sql, seq_of_args)
+            last_cur = None
+            for args in seq_of_args:
+                last_cur = target.execute(sql, args)
+            return last_cur
+
+        try:
+            return _dispatch(self.client)
+        except Exception as error:
+            if not (retry_stale_stream and self.persistent and self._reconnect and _is_stale_turso_stream(error)):
+                raise
+            logger.warning("Turso stream expired; reconnecting and retrying executemany")
+            self.client = self._reconnect(self.client)
+            return _dispatch(self.client)
+
+    def begin(self, immediate=False):
+        if self.tx:
+            raise RuntimeError("A Turso transaction is already active")
+        self._execute_with_reconnect("BEGIN IMMEDIATE" if immediate else "BEGIN", (), retry_stale_stream=True)
+        self.tx = True
+
+    def execute(self, sql, parameters=()):
+        clean_args = _sanitize_params(parameters)
+        try:
+            cursor = self._execute_with_reconnect(sql, clean_args, retry_stale_stream=not self.tx)
+            return TursoCursor(cursor)
+        except Exception as e:
+            if not self.tx and self.persistent and self._reconnect and _is_stale_turso_stream(e):
+                try:
+                    self.client = self._reconnect(self.client)
+                except Exception:
+                    pass
+            logger.error("Turso query failed: %s", e)
+            raise
+
+    def executemany(self, sql, seq_of_parameters=()):
+        clean_seq = [_sanitize_params(params) for params in seq_of_parameters]
+        try:
+            cursor = self._executemany_with_reconnect(sql, clean_seq, retry_stale_stream=not self.tx)
+            return TursoCursor(cursor)
+        except Exception as e:
+            if not self.tx and self.persistent and self._reconnect and _is_stale_turso_stream(e):
+                try:
+                    self.client = self._reconnect(self.client)
+                except Exception:
+                    pass
+            logger.error("Turso executemany failed: %s", e)
+            raise
+
+    def batch(self, queries):
+        if not queries:
+            return []
+
+        all_read_only = all(_is_read_only_query(sql) for sql, _ in queries)
+        if all_read_only and not self.tx:
+            # Consultas de leitura não precisam de transação stateful BEGIN/COMMIT.
+            # Podem ser executadas com retry transparente em caso de stream ocioso.
+            try:
+                return [self.execute(sql, params) for sql, params in queries]
+            except Exception as e:
+                if self.persistent and self._reconnect and _is_stale_turso_stream(e):
+                    logger.warning("Turso read batch hit stale stream; retrying batch after reconnect")
+                    self.client = self._reconnect(self.client)
+                    return [self.execute(sql, params) for sql, params in queries]
+                raise
+
+        started_tx = False
+        if not self.tx:
+            self.begin()
+            started_tx = True
+
+        res = []
+        try:
+            for sql, parameters in queries:
+                res.append(self.execute(sql, parameters))
+            if started_tx:
+                self.commit()
+        except Exception:
+            if started_tx:
+                self.rollback()
+            raise
+        return res
+            
+    def commit(self):
+        try:
+            self.client.commit()
+        except Exception as e:
+            try:
+                self.client.rollback()
+            except Exception:
+                if self.persistent and self._reconnect and _is_stale_turso_stream(e):
+                    try:
+                        self.client = self._reconnect(self.client)
+                    except Exception:
+                        pass
+            raise
+        finally:
+            self.tx = False
+                
+    def rollback(self):
+        try:
+            self.client.rollback()
+        except Exception as e:
+            if self.persistent and self._reconnect and _is_stale_turso_stream(e):
+                try:
+                    self.client = self._reconnect(self.client)
+                except Exception:
+                    pass
+        finally:
+            self.tx = False
+        
+    def close(self):
+        if self.tx:
+            self.rollback()
+        if not self.persistent:
+            self.client.close()
+
+@contextmanager
+def db_transaction(db, immediate=False):
+    """Context manager para gerenciar transações e garantir rollback explícito."""
+    if isinstance(db, TursoConnection):
+        owns_tx = not db.tx
+        if owns_tx:
+            db.begin(immediate=immediate)
+        try:
+            yield db
+            if owns_tx:
+                db.commit()
+        except Exception:
+            if owns_tx:
+                db.rollback()
+            raise
+    else:
+        if not getattr(db, "in_transaction", False):
+            db.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            try:
+                yield db
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+        else:
+            sp_name = f"sp_{os.urandom(4).hex()}"
+            db.execute(f"SAVEPOINT {sp_name}")
+            try:
+                yield db
+                db.execute(f"RELEASE SAVEPOINT {sp_name}")
+            except Exception:
+                db.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+                db.execute(f"RELEASE SAVEPOINT {sp_name}")
+                raise
+
+def get_db():
+    from flask import current_app
+    if "db" not in g:
+        is_testing = current_app.config.get("TESTING", False)
+        turso_url = os.environ.get("TURSO_DATABASE_URL")
+        turso_token = os.environ.get("TURSO_AUTH_TOKEN")
+        
+        if not is_testing and bool(turso_url) != bool(turso_token):
+            raise ValueError("TURSO_DATABASE_URL and TURSO_AUTH_TOKEN must be configured together")
+
+        if turso_url and turso_token and not is_testing:
+            if not turso_url.lower().startswith(("libsql://", "wss://")):
+                raise ValueError("TURSO_DATABASE_URL must use libsql:// or wss:// for transaction support")
+            client = _connect_turso(turso_url, turso_token)
+            g.db = TursoConnection(
+                client,
+                persistent=True,
+                reconnect=lambda failed_client: _reconnect_turso(turso_url, turso_token, failed_client),
+            )
+        else:
+            db_path = os.environ.get("MEDQUEST_DB", os.path.join(BACKEND_DIR, "medquest.db"))
+            g.db = sqlite3.connect(db_path, timeout=10)
+            g.db.row_factory = sqlite3.Row
+            g.db.execute("PRAGMA foreign_keys = ON")
+            g.db.execute("PRAGMA busy_timeout = 10000")
+            try:
+                g.db.execute("PRAGMA journal_mode = WAL")
+                g.db.execute("PRAGMA synchronous = NORMAL")
+                g.db.execute("PRAGMA cache_size = -64000")
+                g.db.execute("PRAGMA mmap_size = 268435456")
+                g.db.execute("PRAGMA temp_store = MEMORY")
+            except sqlite3.OperationalError as e:
+                logger.warning(f"Failed to set SQLite performance pragmas: {e}")
+    return g.db
+
+def close_db(exception=None):
+    db = g.pop("db", None)
+    if db is not None:
+        if exception:
+            if isinstance(db, TursoConnection):
+                if db.tx:
+                    db.rollback()
+            elif getattr(db, "in_transaction", False):
+                if hasattr(db, "rollback"):
+                    db.rollback()
+                else:
+                    db.execute("ROLLBACK")
+        db.close()
+
+def _table_cols(db, table):
+    if isinstance(db, TursoConnection):
+        res = db.execute("SELECT name FROM pragma_table_info(?)", (table,)).fetchall()
+        return [r["name"] for r in res]
+    return [r[0] for r in db.execute("SELECT name FROM pragma_table_info(?)", (table,))]
+
+
+def _create_question_tables(db):
+    db.execute('''CREATE TABLE IF NOT EXISTS questions(
+        id INTEGER PRIMARY KEY, source_file TEXT, source_number INTEGER, year INTEGER,
+        institution_code TEXT, institution_label TEXT, topic TEXT, stem TEXT,
+        correct_letter TEXT, missing_alts INTEGER DEFAULT 0, area TEXT, subtema TEXT,
+        subtema_id TEXT, subtema_orig TEXT, editorial_status TEXT, status TEXT DEFAULT 'active')''')
+    db.execute('''CREATE TABLE IF NOT EXISTS alternatives(
+        id INTEGER PRIMARY KEY, question_id INTEGER, letter TEXT,
+        text TEXT, is_correct INTEGER)''')
+    db.execute('''CREATE TABLE IF NOT EXISTS explanations(
+        question_id INTEGER PRIMARY KEY, explanation_text TEXT, generated_at TEXT)''')
+    db.execute('''CREATE TABLE IF NOT EXISTS question_images(
+        id INTEGER PRIMARY KEY, question_id INTEGER, file_path TEXT, order_index INTEGER)''')
+    db.execute('''CREATE TABLE IF NOT EXISTS attempts(
+        id INTEGER PRIMARY KEY, question_id INTEGER, selected_letter TEXT,
+        is_correct INTEGER, answered_at TEXT, confidence TEXT, user_id TEXT DEFAULT '1', time_spent_ms INTEGER)''')
+
+
+def _create_planner_tables(db):
+    db.execute("CREATE TABLE IF NOT EXISTS favorites (question_id INTEGER, user_id TEXT DEFAULT '1', PRIMARY KEY (question_id, user_id))")
+    db.execute('''CREATE TABLE IF NOT EXISTS spaced_repetition (
+        question_id INTEGER, efactor REAL, interval INTEGER,
+        next_review_date TEXT, user_id TEXT DEFAULT '1', fsrs_card TEXT,
+        PRIMARY KEY (question_id, user_id))''')
+    db.execute('''CREATE TABLE IF NOT EXISTS planner_progress (
+        week INTEGER, studied INTEGER DEFAULT 0, studied_at TEXT,
+        rev24h INTEGER DEFAULT 0, rev7d INTEGER DEFAULT 0, rev30d INTEGER DEFAULT 0,
+         user_id TEXT DEFAULT '1', PRIMARY KEY (week, user_id))''')
+    db.execute('''CREATE TABLE IF NOT EXISTS planner_topic_progress (
+        week INTEGER NOT NULL, subtema TEXT NOT NULL, completed INTEGER DEFAULT 0,
+        completed_at TEXT, user_id TEXT DEFAULT '1',
+        PRIMARY KEY (week, subtema, user_id))''')
+    db.execute('''CREATE TABLE IF NOT EXISTS planner_config (
+        user_id TEXT PRIMARY KEY, exam_date TEXT, start_date TEXT,
+        days_per_week INTEGER DEFAULT 6, questions_per_day INTEGER DEFAULT 30, hours_per_day INTEGER DEFAULT 4, target_score REAL,
+        target_institution TEXT, target_specialty TEXT,
+        updated_at TEXT)''')
+    db.execute('''CREATE TABLE IF NOT EXISTS planner_schedule (
+        user_id TEXT NOT NULL,
+        mode TEXT NOT NULL DEFAULT 'standard' CHECK (mode IN ('standard', 'intensive')),
+        week INTEGER NOT NULL,
+        subtema TEXT NOT NULL,
+        display_order INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (user_id, mode, week, subtema))''')
+    db.execute('''CREATE INDEX IF NOT EXISTS idx_planner_schedule_lookup 
+        ON planner_schedule(user_id, mode, week, display_order)''')
+
+
+def _create_session_tables(db):
+    db.execute('''CREATE TABLE IF NOT EXISTS simulado_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, client_session_id TEXT NOT NULL,
+        planned_duration_seconds INTEGER NOT NULL, elapsed_seconds INTEGER NOT NULL,
+        total_questions INTEGER NOT NULL, answered_count INTEGER NOT NULL, correct_count INTEGER NOT NULL,
+        filters_json TEXT NOT NULL, area_results_json TEXT NOT NULL, completed_at TEXT NOT NULL,
+        user_id TEXT DEFAULT '1', UNIQUE(user_id, client_session_id))''')
+    db.execute('''CREATE TABLE IF NOT EXISTS clinical_cases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        stem TEXT NOT NULL,
+        images TEXT,
+        medical_references TEXT)''')
+    db.execute('''CREATE TABLE IF NOT EXISTS learning_sessions (
+        user_id TEXT NOT NULL,
+        session_type TEXT NOT NULL,
+        state_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (user_id, session_type))''')
+
+
+def _create_system_tables(db):
+    db.execute('''CREATE TABLE IF NOT EXISTS idempotency_keys (
+        user_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        method TEXT NOT NULL,
+        path TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'completed',
+        status_code INTEGER,
+        response_body TEXT,
+        lease_expires_at REAL DEFAULT 0,
+        lease_owner_token TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (user_id, key))''')
+    db.execute('''CREATE TABLE IF NOT EXISTS telemetry_daily_aggregates (
+        date TEXT NOT NULL,
+        route TEXT NOT NULL,
+        method TEXT NOT NULL,
+        p50_ms REAL NOT NULL,
+        p95_ms REAL NOT NULL,
+        p99_ms REAL NOT NULL,
+        request_count INTEGER NOT NULL,
+        error_count INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (date, route, method))''')
+    db.execute('''CREATE TABLE IF NOT EXISTS notification_configs (
+        user_id TEXT PRIMARY KEY,
+        enabled INTEGER DEFAULT 0,
+        preferred_hour INTEGER DEFAULT 8,
+        days_of_week TEXT DEFAULT '[0,1,2,3,4,5,6]',
+        max_daily_reminders INTEGER DEFAULT 1,
+        updated_at TEXT)''')
+    db.execute('''CREATE TABLE IF NOT EXISTS push_subscriptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        endpoint TEXT NOT NULL,
+        p256dh TEXT NOT NULL,
+        auth TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(user_id, endpoint))''')
+    db.execute('''CREATE TABLE IF NOT EXISTS notification_dispatches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        dispatch_date TEXT NOT NULL,
+        status TEXT NOT NULL,
+        error_message TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE(user_id, dispatch_date))''')
+
+
+def _create_tables(db):
+    _create_question_tables(db)
+    _create_planner_tables(db)
+    _create_session_tables(db)
+    _create_system_tables(db)
+
+
+def _migrate_legacy_columns(db):
+    existing_pc_cols = _table_cols(db, "planner_config")
+    if "target_score" not in existing_pc_cols:
+        db.execute("ALTER TABLE planner_config ADD COLUMN target_score REAL")
+    if "target_institution" not in existing_pc_cols:
+        db.execute("ALTER TABLE planner_config ADD COLUMN target_institution TEXT")
+    if "target_specialty" not in existing_pc_cols:
+        db.execute("ALTER TABLE planner_config ADD COLUMN target_specialty TEXT")
+    if "hours_per_day" not in existing_pc_cols:
+        db.execute("ALTER TABLE planner_config ADD COLUMN hours_per_day INTEGER DEFAULT 4")
+
+    existing_cols = _table_cols(db, "idempotency_keys")
+    if "status" not in existing_cols:
+        db.execute("ALTER TABLE idempotency_keys ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'")
+    if "lease_expires_at" not in existing_cols:
+        db.execute("ALTER TABLE idempotency_keys ADD COLUMN lease_expires_at REAL DEFAULT 0")
+    if "lease_owner_token" not in existing_cols:
+        db.execute("ALTER TABLE idempotency_keys ADD COLUMN lease_owner_token TEXT")
+
+
+def _create_indexes(db):
+    db.execute("CREATE INDEX IF NOT EXISTS idx_idempotency_created ON idempotency_keys(created_at)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_idempotency_lease ON idempotency_keys(user_id, lease_expires_at)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user ON push_subscriptions(user_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_notification_dispatches_user_date ON notification_dispatches(user_id, dispatch_date)")
+
+    db.execute("CREATE INDEX IF NOT EXISTS idx_attempts_user_question ON attempts (user_id, question_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_attempts_user_question_latest ON attempts (user_id, question_id, id DESC)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_attempts_correct ON attempts (user_id, is_correct)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_questions_area_subtema ON questions (area, subtema)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_questions_missing_alts ON questions (missing_alts)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_spaced_repetition_review ON spaced_repetition (user_id, next_review_date)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_simulado_sessions_user_completed ON simulado_sessions (user_id, completed_at DESC)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_questions_area ON questions (area)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_questions_institution ON questions (institution_code)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_questions_inst_code_label ON questions (institution_code, institution_label)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_questions_year ON questions (year)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_questions_source ON questions (source_file)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_attempts_answered_at ON attempts (answered_at)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_attempts_user_answered_at ON attempts (user_id, answered_at)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_alternatives_question_id ON alternatives (question_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_question_images_question_id ON question_images (question_id)")
+
+
+def _setup_fts(db):
+    try:
+        with db_transaction(db, immediate=True):
+            db.execute('''CREATE VIRTUAL TABLE IF NOT EXISTS questions_fts USING fts5(
+                stem,
+                explanation
+            )''')
+    except Exception as e:
+        logger.warning("FTS table creation is unavailable: %s", e)
+
+
+def init_db(app):
+    """Cria tabelas de usuário se não existirem e garante colunas novas."""
+    with app.app_context():
+        db = get_db()
+        with db_transaction(db, immediate=True):
+            _create_tables(db)
+            _migrate_legacy_columns(db)
+            _create_indexes(db)
+            apply_pending_migrations(db)
+
+        # FTS is an optional capability and must not invalidate the required schema.
+        _setup_fts(db)

@@ -1,0 +1,14 @@
+{
+  "name": "medquest-aistudio",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "app/frontend"
+  ],
+  "scripts": {
+    "dev": "npm --prefix app/frontend run dev",
+    "build": "npm --prefix app/frontend run build",
+    "start": "npm --prefix app/frontend run start",
+    "lint": "npm --prefix app/frontend run lint"
+  }
+}

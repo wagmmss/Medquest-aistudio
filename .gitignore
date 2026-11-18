@@ -1,0 +1,107 @@
+# ── Segredos ────────────────────────────────────────────────────────
+.env
+.env.local
+*.key
+
+# ── Banco de dados e backups (nunca versionar: 10MB+ binários) ──────
+*.db
+*.db.*
+*.db-journal
+*.db-wal
+*.db-shm
+*.bak
+*.bak-*
+backups/
+
+# ── Logs e saídas de pipeline ───────────────────────────────────────
+*.log
+.background_output_*.txt
+exports/
+outputs/
+test_out*.json
+
+# ── Artefatos de build / deploy ─────────────────────────────────────
+medquest_deploy.zip
+dist/
+build/
+
+# ── Instaladores e material-fonte (grandes binários) ────────────────
+*.exe
+*.pdf
+
+# ── Python ──────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.pytest-*/
+.codex-pytest-*/
+.coverage
+htmlcov/
+
+# ── Node / Next.js ──────────────────────────────────────────────────
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+.vercel
+
+# ── IDE ─────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.iml
+.claude/settings.local.json
+
+# ── SO ──────────────────────────────────────────────────────────────
+Thumbs.db
+desktop.ini
+.DS_Store
+app/backend/medway.har
+
+# ── Playwright ──────────────────────────────────────────────────────
+playwright-report/
+test-results/
+blob-report/
+
+# ── Artefatos PWA gerados pelo next-pwa ─────────────────────────────
+app/frontend/public/sw.js
+app/frontend/public/workbox-*.js
+app/frontend/public/worker-*.js
+app/frontend/public/swe-worker-*.js
+
+# Ignore massive cache and garbage JSON files
+/*.json
+!/package.json
+!/tsconfig.json
+!/tslint.json
+!/canonical_*.json
+!/full_topic_map.json
+!/pediatria_*.json
+classification_*.json
+medway_match_*.json
+medquest.db.backup*
+*.db.before-*
+archive/legacy/data/
+
+# ── Artefatos temporários de apresentação / slides ──────────────────
+.chart-data-*/
+.codex_build/
+.codex-finalizer/
+
+# Local pasted notes may contain credentials.
+/Pasted Text.txt
+
+# ── Runtime local / autoloop / agentes ───────────────────────────────
+data/
+app/backend/data/medway_extracted/
+docs/audits/*.json
+!app/backend/data/osce/
+!app/backend/data/osce/**
+.agents/
+*.jsonl
+inspecionar.py
+export_batch.py
+tests/repros/
+
+
