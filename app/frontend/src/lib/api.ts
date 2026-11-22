@@ -1,0 +1,1006 @@
+import {
+  ThemeProgress, OverviewStats, CoverageResponse, TimelineStat, WeakTopic, Recommendation,
+  BreakdownStat, DistractorStat, PlannerConfig, PlannerProgressMap, PlannerTopicProgressMap, PlannerPlanResponse,
+  PlannerOrganizationMode, PlannerScheduleMode, PlannerMoveTopicPayload, InternatoBlock,
+  QuestionMeta, SubtemaItem, QuestionListItem, QuestionDetail, AttemptResult, SearchResult, SearchFilterOptions,
+  BatchAttemptItem, BatchAttemptResult, BatchDetailResponse,
+  AtRiskTopic, LearningProfile, ExamReadiness,
+  BenchmarkStat, BottleneckTopic, DomainSummaryResponse, ErrorNotebookSummary,
+  InstitutionRadarResponse, AnalysisSummaryResponse,
+  AuthMeResponse, DashboardSummaryResponse, PreceptorFocusResponse,
+  BlindspotsResponse, TriEvaluationResponse, TriEvaluationPayload,
+  OfficialExam, SimuladoSessionItem,
+  LessonsListResponse, LessonDetailResponse, SubtemaLessonsResponse,
+  LessonsSummaryBySubtemaResponse, ContinueLessonResponse, CurrentWeekLessonsResponse,
+  SaveLessonProgressPayload, LessonProgressStatus
+} from "@/types/api";
+
+
+const API_BASE = process.env.NEXT_PUBLIC_APP_URL ||
+  (process.env.VERCEL_PROJECT_PRODUCTION_URL ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}` :
+  (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` :
+  (typeof window !== "undefined" ? "" : "http://localhost:3000")));
+
+import { syncManager } from "./sync";
+import { localDb, getLocalOwnerId, isDeviceOffline } from "./db";
+
+export class OfflineQueuedError extends Error {
+  public localId: string;
+  constructor(localId: string) {
+    super("Operação salva neste dispositivo e aguardando sincronização.");
+    this.name = "OfflineQueuedError";
+    this.localId = localId;
+  }
+}
+
+export class ApiHttpError extends Error {
+  constructor(message: string, public status: number, public code?: string) {
+    super(message);
+  }
+}
+
+export interface AttemptPayload {
+  selected_letter: string;
+  time_spent_ms: number;
+  confidence: string;
+  is_correct?: boolean;
+  user_answer_text?: string;
+  twin_for_question_id?: number;
+  assisted?: boolean;
+}
+
+interface ApiFetchOptions extends RequestInit {
+  timeoutMs?: number;
+  idempotencyKey?: string;
+}
+
+// Mapa em memória para deduplicar requisições GET idênticas em voo (evita tempestade de rede em trocas rápidas de rota/foco)
+const inFlightRequests: Record<string, Promise<unknown> | undefined> = {};
+
+/**
+ * Base fetch function with default headers and resilient timeout
+ */
+async function executeApiFetch<T>(endpoint: string, options?: ApiFetchOptions): Promise<T> {
+  options?.signal?.throwIfAborted();
+  const { timeoutMs: optionTimeoutMs, idempotencyKey: optionIdempotencyKey, ...fetchOptions } = options ?? {};
+  const requestOwner = typeof window !== "undefined" ? getLocalOwnerId() : undefined;
+  const url = `${API_BASE}${endpoint}`;
+
+  const isMutation = fetchOptions.method && ["POST", "PUT", "PATCH", "DELETE"].includes(fetchOptions.method.toUpperCase());
+  const isIdempotentEndpoint = isMutation && (
+    endpoint.includes("/attempt") ||
+    endpoint.includes("/review") ||
+    endpoint.includes("/favorite") ||
+    endpoint === "/api/simulado/sessions" ||
+    (endpoint.includes("/planner/") && !endpoint.includes("/reset"))
+  );
+
+  let idempotencyKey: string | undefined;
+  const headers = new Headers(fetchOptions.headers);
+  if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  if (!headers.has("X-Request-ID") && typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    headers.set("X-Request-ID", crypto.randomUUID());
+  }
+
+  if (isIdempotentEndpoint) {
+    idempotencyKey = optionIdempotencyKey ?? crypto.randomUUID();
+    headers.set("X-Idempotency-Key", idempotencyKey);
+  }
+
+  // Falha rápida se o navegador já estiver sabidamente offline ou em Modo Plantão Forçado
+  if (isDeviceOffline()) {
+    if (isIdempotentEndpoint) {
+      console.warn("[API] Offline imediato detectado (Modo Plantão), enfileirando:", endpoint);
+      const localId = await syncManager.enqueue(url, { ...fetchOptions, headers }, idempotencyKey!);
+      throw new OfflineQueuedError(localId);
+    }
+    throw new TypeError("Falha de rede: Modo Plantão offline ativo");
+  }
+
+  const timeoutMs = optionTimeoutMs ?? (
+    endpoint.includes("/ask_ai") || endpoint.includes("/ai") ? 35000 :
+    endpoint.includes("/batch") || endpoint.includes("/generate") ? 15000 :
+    8000
+  );
+  const controller = new AbortController();
+  let isInternalTimeout = false;
+  const timeoutId = setTimeout(() => {
+    isInternalTimeout = true;
+    controller.abort(new Error("Timeout de conexão"));
+  }, timeoutMs);
+
+  const handleAbort = () => {
+    clearTimeout(timeoutId);
+    controller.abort(options?.signal?.reason);
+  };
+  if (options?.signal) {
+    if (options.signal.aborted) {
+      clearTimeout(timeoutId);
+      controller.abort(options.signal.reason);
+    } else {
+      options.signal.addEventListener("abort", handleAbort, { once: true });
+    }
+  }
+
+  try {
+    const response = await fetch(url, {
+      ...fetchOptions,
+      headers,
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      let errMsg = `${response.status} ${response.statusText}`;
+      let code: string | undefined;
+      try {
+        const errorJson = await response.json();
+        if (errorJson?.error) errMsg = errorJson.error;
+        if (typeof errorJson?.code === "string") code = errorJson.code;
+      } catch {
+        // use status text
+      }
+      throw new ApiHttpError(errMsg, response.status, code);
+    }
+
+    const data = await response.json();
+    return data;
+  } catch (error) {
+    // Aborto intencional iniciado pelo chamador
+    if (options?.signal?.aborted) {
+      throw error;
+    }
+
+    const isRetriableHttpConflict =
+      error instanceof ApiHttpError &&
+      error.status === 409 &&
+      error.code === "idempotency_processing";
+
+    const isNetworkOrTimeout =
+      isInternalTimeout ||
+      error instanceof TypeError ||
+      isRetriableHttpConflict ||
+      (!(error instanceof ApiHttpError) && typeof navigator !== "undefined" && !navigator.onLine);
+
+    if (typeof window !== "undefined" && isIdempotentEndpoint && isNetworkOrTimeout && getLocalOwnerId() === requestOwner) {
+      console.warn("[API] Erro de rede ou timeout detectado, adicionando à fila offline:", endpoint);
+      const localId = await syncManager.enqueue(url, { ...fetchOptions, headers }, idempotencyKey!);
+      throw new OfflineQueuedError(localId);
+    }
+
+    if (isInternalTimeout) {
+      throw new TypeError("Tempo limite de conexão excedido");
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+    options?.signal?.removeEventListener("abort", handleAbort);
+  }
+}
+
+async function apiFetch<T>(endpoint: string, options?: ApiFetchOptions): Promise<T> {
+  const method = (options?.method || "GET").toUpperCase();
+  if (method === "GET" && !options?.signal) {
+    const ownerKey = typeof window !== "undefined" ? getLocalOwnerId() : "ssr";
+    const dedupeKey = `${ownerKey}:${endpoint}`;
+    const existing = inFlightRequests[dedupeKey] as Promise<T> | undefined;
+    if (existing) {
+      return existing;
+    }
+    const promise = executeApiFetch<T>(endpoint, options).finally(() => {
+      delete inFlightRequests[dedupeKey];
+    });
+    inFlightRequests[dedupeKey] = promise;
+    return promise;
+  }
+  return executeApiFetch<T>(endpoint, options);
+}
+
+function getClientTimeZone(): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * API endpoints
+ */
+export const api = {
+  themes: {
+    getProgress: (subtema: string, signal?: AbortSignal) =>
+      apiFetch<ThemeProgress>(`/api/themes/progress?${new URLSearchParams({ subtema })}`, { cache: "no-store", signal }),
+    saveProgress: (subtema: string, progress: Pick<ThemeProgress, "theory_completed" | "study_path">) =>
+      apiFetch<ThemeProgress>(`/api/themes/progress?${new URLSearchParams({ subtema })}`, {
+        method: "PUT", body: JSON.stringify(progress),
+      }),
+  },
+  stats: {
+    getOverview: () => apiFetch<OverviewStats>("/api/stats/overview", { cache: 'no-store' }),
+    getDashboardSummary: (signal?: AbortSignal) => {
+      const tz = getClientTimeZone();
+      const qs = tz ? `?${new URLSearchParams({ tz }).toString()}` : "";
+      return apiFetch<DashboardSummaryResponse>(`/api/dashboard/summary${qs}`, { cache: 'no-store', timeoutMs: 45000, signal });
+    },
+    getAnalysisSummary: (institution?: string, compareInstitution?: string, signal?: AbortSignal) => {
+      const params = new URLSearchParams();
+      if (institution) params.append("institution", institution);
+      if (compareInstitution) params.append("compare_institution", compareInstitution);
+      if (typeof window !== "undefined") {
+        params.append("tz_offset", String(-new Date().getTimezoneOffset()));
+      }
+      const tz = getClientTimeZone();
+      if (tz) params.append("tz", tz);
+      const qs = params.toString();
+      return apiFetch<AnalysisSummaryResponse>(`/api/stats/analysis-summary${qs ? `?${qs}` : ""}`, {
+        cache: "no-store",
+        timeoutMs: 45000,
+        signal,
+      });
+    },
+    getFocusRadar: (institution?: string, prevalence: string = "all") => {
+      const params = new URLSearchParams();
+      if (institution) params.append("institution", institution);
+      if (prevalence) params.append("prevalence", prevalence);
+      const qs = params.toString();
+      return apiFetch<import("@/types/api").FocusRadarResponse>(
+        `/api/stats/focus-radar${qs ? `?${qs}` : ""}`,
+        { cache: "no-store" }
+      );
+    },
+    getCoverage: () => apiFetch<CoverageResponse>("/api/coverage", { cache: 'no-store' }),
+    getTimeline: (days: number = 14, signal?: AbortSignal) => {
+      const params = new URLSearchParams({ days: String(days) });
+      const tz = getClientTimeZone();
+      if (tz) params.append("tz", tz);
+      return apiFetch<TimelineStat[]>(`/api/stats/timeline?${params.toString()}`, { cache: 'no-store', signal });
+    },
+    getWeakTopics: () => apiFetch<WeakTopic[]>("/api/stats/weak-topics", { cache: 'no-store' }),
+    getRecommendations: () => apiFetch<Recommendation[]>("/api/stats/recommendations", { cache: 'no-store' }),
+    getDistractors: () => apiFetch<DistractorStat[]>("/api/stats/distractors", { cache: 'no-store' }),
+    getAtRiskTopics: () => apiFetch<AtRiskTopic[]>("/api/stats/at-risk", { cache: 'no-store' }),
+    getLearningProfile: () => apiFetch<LearningProfile>("/api/stats/learning-profile", { cache: 'no-store' }),
+    getExamReadiness: (institution?: string, signal?: AbortSignal) => apiFetch<ExamReadiness>(`/api/stats/exam-readiness${institution ? `?institution=${encodeURIComponent(institution)}` : ""}`, { cache: 'no-store', signal }),
+    getBreakdown: (by: 'institution' | 'area' | 'year') =>
+      apiFetch<BreakdownStat[]>(`/api/stats/breakdown?by=${by}`, { cache: 'no-store' }),
+    getBenchmark: () => apiFetch<BenchmarkStat>("/api/stats/benchmark", { cache: 'no-store' }),
+    getBottlenecks: (limit: number = 3) => apiFetch<BottleneckTopic[]>(`/api/stats/bottlenecks?limit=${limit}`, { cache: 'no-store' }),
+    getBlindspots: (limit: number = 6, signal?: AbortSignal) =>
+      apiFetch<BlindspotsResponse>(`/api/stats/blindspots?limit=${limit}`, { cache: 'no-store', signal }),
+    getTriReadiness: (institution?: string, signal?: AbortSignal) =>
+      apiFetch<TriEvaluationResponse>(
+        `/api/stats/tri-readiness${institution ? `?institution=${encodeURIComponent(institution)}` : ''}`,
+        { cache: 'no-store', signal }
+      ),
+    getDomainSummary: () => apiFetch<DomainSummaryResponse>("/api/stats/domain-summary", { cache: 'no-store' }),
+    getErrorNotebookSummary: () => apiFetch<ErrorNotebookSummary>("/api/stats/error-notebook-summary", { cache: 'no-store' }),
+    getInstitutionRadar: (institution?: string, compareInstitution?: string, signal?: AbortSignal) => {
+      const params = new URLSearchParams();
+      if (institution) params.append("institution", institution);
+      if (compareInstitution) params.append("compare_institution", compareInstitution);
+      const qs = params.toString();
+      return apiFetch<InstitutionRadarResponse>(`/api/stats/institution-radar${qs ? `?${qs}` : ""}`, { cache: 'no-store', signal });
+    },
+    logRadarAction: (action: "study" | "simulado" | "review") =>
+      apiFetch<{success: boolean}>("/api/stats/institution-radar/action", {
+        method: "POST",
+        body: JSON.stringify({ action }),
+      }),
+    resetProgress: () =>
+      apiFetch<{success: boolean}>("/api/stats/reset", {
+        method: "DELETE",
+      }),
+  },
+  auth: {
+    getMe: (signal?: AbortSignal) => apiFetch<AuthMeResponse>("/api/auth/me", { cache: 'no-store', signal }),
+  },
+  sessions: {
+    get: (sessionType: string) =>
+      apiFetch<{data: unknown, updated_at: string} | {data: null}>(`/api/sessions/${sessionType}`, { cache: 'no-store' }),
+    save: (sessionType: string, data: unknown) =>
+      apiFetch<{success: boolean}>(`/api/sessions/${sessionType}`, {
+        method: "PUT",
+        body: JSON.stringify(data),
+      }),
+    delete: (sessionType: string) =>
+      apiFetch<{success: boolean}>(`/api/sessions/${sessionType}`, {
+        method: "DELETE",
+      }),
+  },
+  planner: {
+    getConfig: () => apiFetch<PlannerConfig>("/api/planner/config", { cache: 'no-store' }),
+    saveConfig: async (config: PlannerConfig) => {
+      // Sanitiza campos derivados/somente-leitura (ex.: primary_institution) que não fazem parte do payload de escrita
+      const payload: Record<string, unknown> = {
+        exam_date: config.exam_date,
+        start_date: config.start_date,
+        days_per_week: config.days_per_week,
+        hours_per_day: config.hours_per_day,
+        target_score: config.target_score,
+        target_institution: config.target_institution,
+        target_institutions: config.target_institutions,
+        target_specialty: config.target_specialty,
+        organization_mode: config.organization_mode,
+      };
+      if (config.internato_blocks !== undefined) {
+        payload.internato_blocks = config.internato_blocks.map((b) => ({
+          start: b.start,
+          end: b.end,
+          area: b.area,
+          ...(b.label ? { label: b.label } : {}),
+          ...(b.hours_per_week != null ? { hours_per_week: b.hours_per_week } : {}),
+        }));
+      }
+      // Remove chaves undefined para não poluir a validação estrita do Pydantic
+      Object.keys(payload).forEach((k) => {
+        if (payload[k] === undefined) delete payload[k];
+      });
+      return apiFetch<{success: boolean}>("/api/planner/config", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+    },
+    resetConfig: (payload?: { scope?: "schedule" | "progress" | "all"; mode?: PlannerScheduleMode }) =>
+      apiFetch<{success: boolean; scope?: string}>("/api/planner/config/reset", {
+        method: "POST",
+        body: payload ? JSON.stringify(payload) : undefined,
+      }),
+    saveInternatoBlocks: (blocks: InternatoBlock[]) =>
+      apiFetch<{success: boolean; internato_blocks: InternatoBlock[]}>("/api/planner/internato-blocks", {
+        method: "PUT",
+        body: JSON.stringify({ blocks }),
+      }),
+    getProgress: () => apiFetch<PlannerProgressMap>("/api/planner", { cache: 'no-store' }),
+    getTopicProgress: () => apiFetch<PlannerTopicProgressMap>("/api/planner/topics", { cache: 'no-store' }),
+    generatePlan: (data: {
+      start_date?: string;
+      exam_date: string;
+      hours_per_week: number;
+      intensive?: boolean;
+      organization?: PlannerOrganizationMode;
+      regenerate?: boolean;
+    }) =>
+      apiFetch<PlannerPlanResponse>("/api/generate_plan", {
+        method: "POST",
+        body: JSON.stringify(data),
+      }),
+    markStudy: (week: number, studied: boolean) =>
+      apiFetch<{success: boolean}>(`/api/planner/${week}/study`, {
+        method: "POST",
+        body: JSON.stringify({ studied }),
+      }),
+    markTopic: (week: number, subtema: string, completed: boolean) =>
+      apiFetch<{success: boolean}>(`/api/planner/${week}/topic`, {
+        method: "POST",
+        body: JSON.stringify({ subtema, completed }),
+      }),
+    moveTopic: (data: PlannerMoveTopicPayload) =>
+      apiFetch<{
+        success: boolean;
+        subtema: string;
+        source_week: number;
+        target_week: number;
+        target_index?: number;
+      }>("/api/planner/move-topic", {
+        method: "POST",
+        body: JSON.stringify(data),
+      }),
+    markRevision: (week: number, type: 'rev24h' | 'rev7d' | 'rev30d', checked: boolean) =>
+      apiFetch<{success: boolean}>(`/api/planner/${week}/revision`, {
+        method: "POST",
+        body: JSON.stringify({ type, checked }),
+      }),
+    exportIcs: async () => {
+      const url = `${API_BASE}/api/planner/export/ics`;
+      const token = typeof window !== "undefined" ? (window as unknown as { __medquest_token?: string }).__medquest_token : undefined;
+      const headers: Record<string, string> = {};
+      if (token) headers["Authorization"] = `Bearer ${token}`;
+      const res = await fetch(url, { headers });
+      if (!res.ok) throw new Error("Falha ao exportar cronograma para agenda");
+      const blob = await res.blob();
+      const downloadUrl = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = downloadUrl;
+      a.download = `medquest_cronograma_${new Date().toISOString().split("T")[0]}.ics`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(downloadUrl);
+    },
+    getCalendarFeedUrl: () => {
+      const base = typeof window !== "undefined" ? (API_BASE || window.location.origin) : API_BASE;
+      return `${base}/api/planner/calendar/feed`;
+    },
+  },
+  questions: {
+    getMeta: (filters?: Record<string, string | string[]>) => {
+      const params = new URLSearchParams();
+      if (filters) {
+        for (const [key, value] of Object.entries(filters)) {
+          if (Array.isArray(value)) {
+            value.forEach(v => params.append(key, v));
+          } else if (value !== undefined && value !== "") {
+            params.append(key, value);
+          }
+        }
+      }
+      params.delete("limit");
+      const qs = params.toString();
+      return apiFetch<QuestionMeta>(`/api/meta${qs ? `?${qs}` : ''}`, { cache: 'no-store' });
+    },
+    getTaxonomy: () => apiFetch<Record<string, Record<string, string>>>("/api/taxonomy", { cache: 'force-cache' }),
+    updateClassification: (qid: number, data: { area: string; subtema: string; topic?: string }) =>
+      apiFetch<{ success: boolean; question: { id: number; area: string; subtema: string; subtema_id: string; topic: string } }>(
+        `/api/questions/${qid}/classification`,
+        {
+          method: "PATCH",
+          body: JSON.stringify(data),
+        }
+      ),
+    deleteQuestion: (qid: number) =>
+      apiFetch<{ success: boolean; message: string; id: number }>(
+        `/api/questions/${qid}`,
+        {
+          method: "DELETE",
+        }
+      ),
+    getSubtemas: (area?: string, q?: string) => {
+      const params = new URLSearchParams();
+      if (area) params.append("area", area);
+      if (q) params.append("q", q);
+      return apiFetch<SubtemaItem[]>(`/api/subtemas?${params.toString()}`, { next: { revalidate: 60 } });
+    },
+    getRemediation: (options?: { subtema?: string; area?: string; limit?: number }, signal?: AbortSignal) => {
+      const params = new URLSearchParams();
+      if (options?.subtema) params.append("subtema", options.subtema);
+      if (options?.area) params.append("area", options.area);
+      if (options?.limit) params.append("limit", String(options.limit));
+      const qs = params.toString();
+      return apiFetch<QuestionListItem[]>(`/api/questions/remediation${qs ? `?${qs}` : ''}`, { cache: 'no-store', signal });
+    },
+    evaluateTri: (payload: TriEvaluationPayload, signal?: AbortSignal) =>
+      apiFetch<TriEvaluationResponse>("/api/simulado/tri-evaluation", {
+        method: "POST",
+        body: JSON.stringify(payload),
+        signal,
+      }),
+    getList: async (filters: Record<string, string | string[]>) => {
+      const getLocalFallback = async () => {
+        if (typeof window !== "undefined" && localDb) {
+          const uid = getLocalOwnerId();
+          let cached = await localDb.questions.where('_owner_id').equals(uid).toArray();
+
+          if (filters.area) {
+            const area = Array.isArray(filters.area) ? filters.area[0] : filters.area;
+            cached = cached.filter(q => q.area === area);
+          }
+          if (filters.subtema) {
+            const subtema = Array.isArray(filters.subtema) ? filters.subtema[0] : filters.subtema;
+            cached = cached.filter(q => q.subtema === subtema);
+          }
+          if (filters.institution) {
+            const inst = Array.isArray(filters.institution) ? filters.institution[0] : filters.institution;
+            cached = cached.filter(q => q.institution_code === inst);
+          }
+          if (cached.length > 0) {
+            if (!filters.institution && cached.some(q => Boolean((q as unknown as { is_target_institution?: boolean }).is_target_institution))) {
+              cached = [...cached].sort((a, b) => {
+                const aTarget = (a as unknown as { is_target_institution?: boolean }).is_target_institution ? 1 : 0;
+                const bTarget = (b as unknown as { is_target_institution?: boolean }).is_target_institution ? 1 : 0;
+                return bTarget - aTarget;
+              });
+            }
+            const limit = typeof filters.limit === "string" ? parseInt(filters.limit, 10) : 50;
+            return cached.slice(0, isNaN(limit) ? 50 : limit).map(q => ({
+              id: q.id,
+              source_file: q.source_file,
+              source_number: q.source_number,
+              year: q.year,
+              institution_code: q.institution_code,
+              institution_label: q.institution_label,
+              topic: q.topic,
+              area: q.area,
+              subtema: q.subtema,
+              is_target_institution: Boolean((q as unknown as { is_target_institution?: boolean }).is_target_institution),
+            }));
+          }
+        }
+        return null;
+      };
+
+      if (isDeviceOffline()) {
+        const local = await getLocalFallback();
+        if (local) return local;
+      }
+
+      const params = new URLSearchParams();
+      for (const [key, value] of Object.entries(filters)) {
+        if (Array.isArray(value)) {
+          value.forEach(v => params.append(key, v));
+        } else if (value !== undefined && value !== "") {
+          params.append(key, value);
+        }
+      }
+      try {
+        return await apiFetch<QuestionListItem[]>(`/api/questions?${params.toString()}`, { cache: 'no-store' });
+      } catch (err) {
+        const local = await getLocalFallback();
+        if (local) return local;
+        throw err;
+      }
+    },
+    getDetail: async (id: number) => {
+      const getLocalFallback = async () => {
+        if (typeof window !== "undefined" && localDb) {
+          const uid = getLocalOwnerId();
+          const cached = await localDb.questions.get([id, uid]);
+
+          if (cached) return cached;
+        }
+        return null;
+      };
+
+      if (isDeviceOffline()) {
+        const local = await getLocalFallback();
+        if (local) return local;
+      }
+
+      try {
+        return await apiFetch<QuestionDetail>(`/api/questions/${id}`, { cache: 'no-store' });
+      } catch (err) {
+        const local = await getLocalFallback();
+        if (local) return local;
+        throw err;
+      }
+    },
+    postAttempt: (id: number, body: AttemptPayload, idempotencyKey: string) =>
+      apiFetch<AttemptResult>(`/api/questions/${id}/attempt`, {
+        method: "POST",
+        body: JSON.stringify(body),
+        idempotencyKey,
+      }),
+    submitAttempt: (id: number, selected_letter: string, time_spent_ms: number, confidence: string = "defer", is_correct?: boolean | null, user_answer_text?: string, twin_for_question_id?: number | null, assisted?: boolean) => {
+      const body: AttemptPayload = {
+        selected_letter,
+        time_spent_ms,
+        confidence,
+        ...(is_correct !== undefined && is_correct !== null ? { is_correct } : {}),
+        ...(user_answer_text ? { user_answer_text } : {}),
+        ...(twin_for_question_id ? { twin_for_question_id } : {}),
+        ...(assisted !== undefined ? { assisted: Boolean(assisted) } : {})
+      };
+      return api.questions.postAttempt(id, body, crypto.randomUUID());
+    },
+    reviewFSRS: (id: number, confidence: string, is_correct?: boolean, twin_for_question_id?: number | null, attempt_id?: number | null, assisted?: boolean) =>
+      apiFetch<{success: boolean, next_review_date: string, is_correct?: boolean, assisted?: boolean}>(`/api/questions/${id}/review`, {
+        method: "POST",
+        body: JSON.stringify({
+          confidence,
+          ...(is_correct !== undefined ? { is_correct } : {}),
+          ...(twin_for_question_id ? { twin_for_question_id } : {}),
+          ...(attempt_id ? { attempt_id } : {}),
+          ...(assisted !== undefined ? { assisted: Boolean(assisted) } : {})
+        })
+      }),
+    toggleFavorite: (id: number) => apiFetch<{is_favorite: boolean}>(`/api/questions/${id}/favorite`, {
+      method: "POST"
+    }),
+    search: (
+      q: string,
+      optionsOrSemantic: boolean | SearchFilterOptions = false,
+      signal?: AbortSignal
+    ) => {
+      const opts = typeof optionsOrSemantic === "boolean" ? { semantic: optionsOrSemantic } : optionsOrSemantic;
+      const params = new URLSearchParams();
+      if (q) params.set("q", q);
+      if (opts.semantic) params.set("semantic", "true");
+      if (opts.institution) params.set("institution", opts.institution);
+      if (opts.area) params.set("area", opts.area);
+      if (opts.year) params.set("year", String(opts.year));
+      if (opts.has_images) params.set("has_images", "true");
+      if (opts.limit) params.set("limit", String(opts.limit));
+      if (opts.offset) params.set("offset", String(opts.offset));
+      return apiFetch<SearchResult[]>(`/api/search?${params.toString()}`, { cache: "no-store", signal });
+    },
+    askAI: (
+      id: number,
+      user_question?: string,
+      user_letter?: string,
+      chat_history?: Array<{ role: "user" | "assistant"; content: string }>
+    ) =>
+      apiFetch<{
+        answer: string;
+        model: string;
+        source: string;
+        grounding_sources?: Array<{
+          source_file: string;
+          source_type?: string;
+          topic?: string;
+          subtopic?: string;
+          title?: string;
+        }>;
+        tool_call?: {
+          name: string;
+          data: Record<string, unknown>;
+        };
+      }>(`/api/questions/${id}/ask_ai`, {
+        method: "POST",
+        body: JSON.stringify({ user_question, user_letter, chat_history }),
+        timeoutMs: 35000,
+      }),
+    getSimuladoUSP: async () => {
+      const getLocalFallback = async () => {
+        if (typeof window !== "undefined" && localDb) {
+          const uid = getLocalOwnerId();
+          const cached = await localDb.questions.where('_owner_id').equals(uid).toArray();
+          if (cached.length > 0) {
+            return cached.map(q => ({
+              id: q.id,
+              source_file: q.source_file,
+              source_number: q.source_number,
+              year: q.year,
+              institution_code: q.institution_code,
+              institution_label: q.institution_label,
+              topic: q.topic,
+              area: q.area,
+              subtema: q.subtema,
+            }));
+          }
+        }
+        return null;
+      };
+
+      if (isDeviceOffline()) {
+        const local = await getLocalFallback();
+        if (local) return local;
+      }
+
+      try {
+        return await apiFetch<QuestionListItem[]>("/api/simulado/usp", { cache: 'no-store' });
+      } catch (err) {
+        const local = await getLocalFallback();
+        if (local) return local;
+        throw err;
+      }
+    },
+    getCustomSimulado: async (config: { institutions?: string[], years?: string[], questions_per_area?: number, duration_minutes?: number, force_4_options?: boolean }) => {
+      const getLocalFallback = async () => {
+        if (typeof window !== "undefined" && localDb) {
+          const uid = getLocalOwnerId();
+          const cached = await localDb.questions.where('_owner_id').equals(uid).toArray();
+
+          if (cached.length > 0) {
+            return cached.map(q => ({
+              id: q.id,
+              source_file: q.source_file,
+              source_number: q.source_number,
+              year: q.year,
+              institution_code: q.institution_code,
+              institution_label: q.institution_label,
+              topic: q.topic,
+              area: q.area,
+              subtema: q.subtema,
+            }));
+          }
+        }
+        return null;
+      };
+
+      if (isDeviceOffline()) {
+        const local = await getLocalFallback();
+        if (local) return local;
+      }
+
+      try {
+        return await apiFetch<QuestionListItem[]>("/api/simulado/custom", {
+          method: "POST",
+          body: JSON.stringify(config)
+        });
+      } catch (err) {
+        const local = await getLocalFallback();
+        if (local) return local;
+        throw err;
+      }
+    },
+    saveSimuladoSession: (data: {
+      client_session_id: string; planned_duration_seconds: number; elapsed_seconds: number;
+      total_questions: number; answered_count: number; correct_count: number;
+      filters: Record<string, unknown>; area_results: Array<Record<string, unknown>>;
+    }) => apiFetch<{success: boolean}>("/api/simulado/sessions", {
+      method: "POST", body: JSON.stringify(data),
+    }),
+    getOfficialExams: (includeSimilar: boolean = false) => {
+      const qs = includeSimilar ? "?similar_institutions=1" : "";
+      return apiFetch<{ exams: OfficialExam[] }>(`/api/simulado/official-exams${qs}`, { cache: "no-store" });
+    },
+    getSimuladoSessions: () => apiFetch<{ sessions: SimuladoSessionItem[] }>("/api/simulado/sessions", { cache: "no-store" }),
+    deleteSimuladoSession: (sessionId: string) => apiFetch<{ success: boolean; deleted: boolean }>(`/api/simulado/sessions/${sessionId}`, {
+      method: "DELETE"
+    }),
+    submitAttemptBatch: (attempts: BatchAttemptItem[], idempotencyKey?: string) => apiFetch<BatchAttemptResult>(`/api/attempt/batch`, {
+      method: "POST",
+      body: JSON.stringify({ attempts }),
+      idempotencyKey,
+    }),
+    getBatch: async (ids: number[], force_4_options: boolean = false) => {
+      const getLocalFallback = async () => {
+        if (typeof window !== "undefined" && localDb) {
+          try {
+            const uid = getLocalOwnerId();
+            const keys: [number, string][] = ids.map(id => [id, uid]);
+            const cachedList = await localDb.questions.bulkGet(keys);
+            const cached = cachedList.filter((q): q is NonNullable<typeof q> => q != null);
+            // A partial batch would make a resumed simulado render questions
+            // without their alternatives. Fall back to the network instead.
+            if (cached.length === ids.length) {
+              return { questions: cached } as unknown as BatchDetailResponse;
+            }
+          } catch (e) {
+            console.error("Dexie error loading batch", e);
+          }
+        }
+        return null;
+      };
+
+      if (isDeviceOffline()) {
+        const local = await getLocalFallback();
+        if (local) return local;
+      }
+
+      try {
+        return await apiFetch<BatchDetailResponse>(`/api/questions/batch`, {
+          method: "POST",
+          body: JSON.stringify({ ids, force_4_options })
+        });
+      } catch (err) {
+        const local = await getLocalFallback();
+        if (local) return local;
+        throw err;
+      }
+    },
+  },
+  ai: {
+    getPreceptorFocus: (options?: { generateAi?: boolean; forceRefresh?: boolean }) => {
+      const generateAi = options?.generateAi !== false;
+      return apiFetch<PreceptorFocusResponse>("/api/ai/preceptor_focus", {
+        method: "POST",
+        body: JSON.stringify({
+          generate_ai: generateAi,
+          force_refresh: options?.forceRefresh,
+        }),
+        timeoutMs: 35000,
+      });
+    },
+  },
+  osce: {
+    getStations: (params?: { area?: string; institution?: string; difficulty?: string }) => {
+      const search = new URLSearchParams();
+      if (params?.area) search.set("area", params.area);
+      if (params?.institution) search.set("institution", params.institution);
+      if (params?.difficulty) search.set("difficulty", params.difficulty);
+      const qs = search.toString();
+      return apiFetch<{ stations: import("@/types/api").OsceStation[]; count: number }>(`/api/osce/stations${qs ? `?${qs}` : ""}`, { cache: "no-store" });
+    },
+    getStation: (stationId: number) => apiFetch<import("@/types/api").OsceStationDetail>(`/api/osce/stations/${stationId}`, { cache: "no-store" }),
+    startSession: (stationId: number, circuitSessionId?: string, mode?: "blind" | "guided") => apiFetch<{
+      session_id: string;
+      station_id: number;
+      title: string;
+      duration_seconds: number;
+      start_time: string;
+      transcript: import("@/types/api").OsceTranscriptItem[];
+      mode?: "blind" | "guided";
+      guided_feedback?: import("@/types/api").OsceLiveFeedback;
+    }>("/api/osce/sessions/start", {
+      method: "POST",
+      body: JSON.stringify({ station_id: stationId, circuit_session_id: circuitSessionId, mode: mode || "blind" }),
+    }),
+    interact: (
+      sessionId: string,
+      message: string,
+      elapsedSeconds: number,
+      target: "PATIENT" | "EXAMINER" = "PATIENT",
+      currentVitals?: import("@/types/api").OscePhysiologyVitals | Record<string, unknown>
+    ) => apiFetch<{
+      reply: string;
+      sender: "paciente" | "examinador";
+      elapsed_seconds: number;
+      transcript_count: number;
+      guided_feedback?: import("@/types/api").OsceLiveFeedback;
+    }>(`/api/osce/sessions/${sessionId}/interact`, {
+      method: "POST",
+      body: JSON.stringify({
+        message,
+        elapsed_seconds: elapsedSeconds,
+        target,
+        current_vitals: currentVitals
+      }),
+    }),
+    executeAction: (sessionId: string, actionType: string, actionTarget: string, elapsedSeconds: number) => apiFetch<{
+      action_type: string;
+      target: string;
+      examiner_message: string;
+      payload: Record<string, unknown>;
+      elapsed_seconds: number;
+      guided_feedback?: import("@/types/api").OsceLiveFeedback;
+    }>(`/api/osce/sessions/${sessionId}/action`, {
+      method: "POST",
+      body: JSON.stringify({ action_type: actionType, action_target: actionTarget, elapsed_seconds: elapsedSeconds }),
+    }),
+    finishSession: (sessionId: string, conductNotes?: string) => apiFetch<import("@/types/api").OsceFinishResponse>(`/api/osce/sessions/${sessionId}/finish`, {
+      method: "POST",
+      body: JSON.stringify({ conduct_notes: conductNotes }),
+    }),
+    dispatchSpeech: (sessionId: string, message: string, elapsedSeconds: number) => apiFetch<import("@/types/api").OsceDispatchSpeechResponse>(`/api/osce/sessions/${sessionId}/dispatch_speech`, {
+      method: "POST",
+      body: JSON.stringify({ message, elapsed_seconds: elapsedSeconds }),
+    }),
+    getReport: (sessionId: string) => apiFetch<import("@/types/api").OsceReportResponse>(`/api/osce/sessions/${sessionId}/report`, { cache: "no-store" }),
+    getDrugs: () => apiFetch<{ drugs: import("@/types/api").OsceDrugItem[]; count: number }>("/api/osce/drugs", { cache: "no-store" }),
+    getProcedures: () => apiFetch<{ procedures: import("@/types/api").OsceProcedureCatalogItem[]; count: number }>("/api/osce/procedures", { cache: "no-store" }),
+    prescribe: (sessionId: string, prescription: import("@/types/api").OscePrescriptionItem[], elapsedSeconds: number) => apiFetch<import("@/types/api").OscePrescribeResponse>(`/api/osce/sessions/${sessionId}/prescribe`, {
+      method: "POST",
+      body: JSON.stringify({ prescription, elapsed_seconds: elapsedSeconds }),
+    }),
+    performProcedure: (sessionId: string, procedureType: string, anatomicalSite: string, elapsedSeconds: number) => apiFetch<import("@/types/api").OsceProcedureResponse>(`/api/osce/sessions/${sessionId}/procedure`, {
+      method: "POST",
+      body: JSON.stringify({ procedure_type: procedureType, anatomical_site: anatomicalSite, elapsed_seconds: elapsedSeconds }),
+    }),
+    getLiveFeedback: (sessionId: string, elapsedSeconds: number) => apiFetch<import("@/types/api").OsceLiveFeedback>(`/api/osce/sessions/${sessionId}/live_feedback?elapsed_seconds=${elapsedSeconds}`, { cache: "no-store" }),
+    getCircuitPlan: (institution?: string) => {
+      const qs = institution ? `?institution=${encodeURIComponent(institution)}` : "";
+      return apiFetch<import("@/types/api").OsceCircuitPlanResponse>(`/api/osce/circuits/plan${qs}`, { cache: "no-store" });
+    },
+    getCircuitSummary: (circuitId: string) =>
+      apiFetch<import("@/types/api").OsceCircuitSummaryResponse>(`/api/osce/circuits/${circuitId}/summary`, { cache: "no-store" }),
+  },
+  presets: {
+    list: () =>
+      apiFetch<{ presets: import("@/types/api").StudyPreset[] }>("/api/presets", { cache: "no-store" }),
+    create: (name: string, filters: Record<string, string | string[]>) =>
+      apiFetch<import("@/types/api").StudyPreset>("/api/presets", {
+        method: "POST",
+        body: JSON.stringify({ name, filters }),
+      }),
+    remove: (presetId: number) =>
+      apiFetch<{ deleted: boolean; id: number }>(`/api/presets/${presetId}`, {
+        method: "DELETE",
+      }),
+  },
+  notes: {
+    list: (params?: { area?: string; q?: string }, signal?: AbortSignal) => {
+      const qs = new URLSearchParams();
+      if (params?.area) qs.set("area", params.area);
+      if (params?.q) qs.set("q", params.q);
+      const suffix = qs.toString() ? `?${qs.toString()}` : "";
+      return apiFetch<{ notes: import("@/types/api").QuestionUserNote[] }>(`/api/notes${suffix}`, {
+        cache: "no-store",
+        signal,
+      });
+    },
+    getByQuestion: (qid: number) =>
+      apiFetch<import("@/types/api").QuestionUserNote>(`/api/questions/${qid}/note`, {
+        cache: "no-store",
+      }),
+    save: (
+      qid: number,
+      payload: { highlights: import("@/types/api").QuestionHighlight[]; note_text: string }
+    ) =>
+      apiFetch<import("@/types/api").QuestionUserNote>(`/api/questions/${qid}/note`, {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      }),
+    remove: (qid: number) =>
+      apiFetch<{ deleted: boolean; question_id: number }>(`/api/questions/${qid}/note`, {
+        method: "DELETE",
+      }),
+  },
+  lessons: {
+    list: (
+      params?: {
+        course?: string;
+        area?: string;
+        subtema?: string;
+        q?: string;
+        status?: string;
+        essential_only?: boolean;
+        limit?: number;
+      },
+      signal?: AbortSignal
+    ) => {
+      const qs = new URLSearchParams();
+      if (params?.course) qs.set("course", params.course);
+      if (params?.area) qs.set("area", params.area);
+      if (params?.subtema) qs.set("subtema", params.subtema);
+      if (params?.q) qs.set("q", params.q);
+      if (params?.status) qs.set("status", params.status);
+      if (params?.essential_only) qs.set("essential_only", "1");
+      if (params?.limit) qs.set("limit", String(params.limit));
+      const suffix = qs.toString() ? `?${qs.toString()}` : "";
+      return apiFetch<LessonsListResponse>(`/api/lessons${suffix}`, { cache: "no-store", signal });
+    },
+    get: (lessonId: number) =>
+      apiFetch<LessonDetailResponse>(`/api/lessons/${lessonId}`, { cache: "no-store" }),
+    listNotes: (params?: { area?: string; q?: string }, signal?: AbortSignal) => {
+      const qs = new URLSearchParams();
+      if (params?.area) qs.set("area", params.area);
+      if (params?.q) qs.set("q", params.q);
+      const suffix = qs.toString() ? `?${qs.toString()}` : "";
+      return apiFetch<{ notes: import("@/types/api").LessonUserNote[] }>(`/api/lessons/notes${suffix}`, {
+        cache: "no-store",
+        signal,
+      });
+    },
+    bySubtema: (subtema: string) =>
+      apiFetch<SubtemaLessonsResponse>(
+        `/api/lessons/by-subtema?subtema=${encodeURIComponent(subtema)}`,
+        { cache: "no-store" }
+      ),
+    summaryBySubtema: () =>
+      apiFetch<LessonsSummaryBySubtemaResponse>("/api/lessons/summary-by-subtema", {
+        cache: "no-store",
+      }),
+    getContinue: () =>
+      apiFetch<ContinueLessonResponse>("/api/lessons/continue", {
+        cache: "no-store",
+      }),
+    getCurrentWeek: () =>
+      apiFetch<CurrentWeekLessonsResponse>("/api/lessons/current-week", {
+        cache: "no-store",
+      }),
+    saveProgress: (lessonId: number, payload: SaveLessonProgressPayload) =>
+      apiFetch<{
+        lesson_id: number;
+        status: LessonProgressStatus;
+        bookmark_seconds: number;
+        notes: string;
+        has_notes?: boolean;
+        completed_at: string | null;
+        updated_at: string;
+        theme_theory_completed: boolean;
+      }>(`/api/lessons/${lessonId}/progress`, {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      }),
+    updateMapping: (
+      lessonId: number,
+      payload: { subtema?: string | null; is_essential?: boolean }
+    ) =>
+      apiFetch<{
+        lesson_id: number;
+        area: string;
+        subtema: string | null;
+        is_essential: boolean;
+        updated_at: string;
+      }>(`/api/lessons/${lessonId}/mapping`, {
+        method: "PATCH",
+        body: JSON.stringify(payload),
+      }),
+    getCycle: (subtema?: string) => {
+      const suffix = subtema ? `?subtema=${encodeURIComponent(subtema)}` : "";
+      return apiFetch<import("@/types/api").LessonCycleResponse>(`/api/lessons/cycle${suffix}`, {
+        cache: "no-store",
+      });
+    },
+    saveCycleSettings: (payload: {
+      default_pre_questions?: number;
+      default_post_questions?: number;
+    }) =>
+      apiFetch<import("@/types/api").LessonCycleSettings>("/api/lessons/cycle/settings", {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      }),
+    saveCyclePhase: (payload: import("@/types/api").SaveLessonCyclePayload) =>
+      apiFetch<{
+        cycle: import("@/types/api").LessonStudyCycle;
+        settings: import("@/types/api").LessonCycleSettings;
+      }>("/api/lessons/cycle", {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      }),
+  },
+};
+
+

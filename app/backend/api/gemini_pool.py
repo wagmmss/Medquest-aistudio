@@ -1,0 +1,731 @@
+"""
+Gemini Key Pool & Concurrency Engine.
+Gerencia um pool multi-chave e multi-modelo de APIs Google AI com balanceamento Round-Robin,
+detecção automática de Rate Limit (HTTP 429), isolamento de chave com cooldown inteligente,
+fallback entre modelos Flash e execução concorrente de alto rendimento.
+"""
+
+import os
+import json
+import time
+import logging
+import threading
+import urllib.request
+import urllib.error
+import email.utils
+import re
+from typing import List, Dict, Any, Optional, Tuple, Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from pathlib import Path
+from dotenv import load_dotenv, find_dotenv
+
+# Garante que as variáveis de ambiente foram carregadas se gemini_pool for importado diretamente
+_env_path = Path(__file__).resolve().parent.parent / ".env"
+if _env_path.exists():
+    load_dotenv(_env_path)
+else:
+    load_dotenv(find_dotenv())
+
+logger = logging.getLogger(__name__)
+
+# Mantém o modelo Flash completo mais estável primeiro para qualidade clínica no
+# Preceptor, com fallback imediato para Flash-Lite de alta cota.
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview")
+DEFAULT_FALLBACK_MODELS = (
+    "gemini-3-flash-preview",
+    "gemini-3.1-flash-lite",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+)
+
+
+class KeyState:
+    def __init__(self, key: str, index: int):
+        self.key = key
+        self.index = index
+        self.consumer: str = ""
+        self.cooldown_until: float = 0.0
+        self.model_cooldown_until: Dict[str, float] = {}
+        self.total_calls: int = 0
+        self.success_calls: int = 0
+        self.error_calls: int = 0
+        self.consecutive_429: int = 0
+        self.model_consecutive_429: Dict[str, int] = {}
+        self.last_error: str = ""
+
+    @property
+    def is_available(self) -> bool:
+        return time.time() >= self.cooldown_until
+
+    def is_available_for(self, model: Optional[str] = None) -> bool:
+        if not self.is_available:
+            return False
+        return not model or time.time() >= self.model_cooldown_until.get(model, 0.0)
+
+    def mark_success(self, model: Optional[str] = None):
+        self.total_calls += 1
+        self.success_calls += 1
+        if model:
+            self.model_consecutive_429[model] = 0
+        else:
+            self.consecutive_429 = 0
+
+    def mark_rate_limit(
+        self,
+        cooldown_seconds: float = 60.0,
+        reason: str = "Rate Limit (429)",
+        model: Optional[str] = None,
+    ):
+        self.total_calls += 1
+        self.error_calls += 1
+        if model:
+            consecutive_429 = self.model_consecutive_429.get(model, 0) + 1
+            self.model_consecutive_429[model] = consecutive_429
+        else:
+            self.consecutive_429 += 1
+            consecutive_429 = self.consecutive_429
+        # Backoff progressivo, independente para cada modelo da mesma chave.
+        actual_cooldown = cooldown_seconds * max(1, min(consecutive_429, 3))
+        cooldown_until = time.time() + actual_cooldown
+        if model:
+            self.model_cooldown_until[model] = cooldown_until
+        else:
+            self.cooldown_until = cooldown_until
+        self.last_error = f"{reason} [Cooldown {actual_cooldown:.0f}s]"
+        scope = f" para o modelo {model}" if model else ""
+        logger.warning(f"[GeminiPool] Chave #{self.index} em cooldown{scope} por {actual_cooldown:.0f}s: {reason}")
+
+    def mark_error(self, err: str, cooldown_seconds: float = 60.0, model: Optional[str] = None):
+        self.total_calls += 1
+        self.error_calls += 1
+        self.last_error = err
+        err_lower = err.lower()
+        if any(keyword in err_lower for keyword in ["timed out", "timeout", "timedout", "connection", "unavailable", "503", "504", "reset"]):
+            cooldown_until = time.time() + cooldown_seconds
+            if model:
+                self.model_cooldown_until[model] = cooldown_until
+            else:
+                self.cooldown_until = cooldown_until
+            scope = f" para o modelo {model}" if model else ""
+            logger.warning(f"[GeminiPool] Chave #{self.index} em cooldown{scope} por {cooldown_seconds:.0f}s devido a erro: {err}")
+
+
+class GeminiPool:
+    def __init__(self, keys: Optional[List[str]] = None, default_model: str = DEFAULT_MODEL):
+        self.default_model = default_model
+        self.models = self._load_models(default_model)
+        self.lock = threading.Lock()
+        self._keys: List[KeyState] = []
+        self._consumer_cooldown_until: Dict[Tuple[str, Optional[str]], float] = {}
+        self._current_index = 0
+        self._load_keys(keys)
+
+    def _load_keys(self, explicit_keys: Optional[List[str]] = None):
+        if explicit_keys:
+            raw_list = explicit_keys
+        else:
+            raw_env = os.environ.get("GEMINI_API_KEYS", "") or os.environ.get("GEMINI_API_KEY", "")
+            raw_list = [k.strip() for k in raw_env.split(",") if k.strip()]
+
+        self._keys = [
+            KeyState(key=k, index=i + 1)
+            for i, k in enumerate(raw_list)
+            if len(k) > 10 and not k.lower().startswith(("dummy", "test", "gsk_test"))
+        ]
+        if not self._keys:
+            logger.warning("[GeminiPool] Nenhuma chave Gemini válida encontrada.")
+        else:
+            logger.info(f"[GeminiPool] {len(self._keys)} chaves Google AI registradas com sucesso.")
+
+    @staticmethod
+    def _split_models(value: str) -> List[str]:
+        return [model.strip() for model in value.split(",") if model.strip()]
+
+    def _load_models(self, default_model: str) -> List[str]:
+        """Retorna a cadeia de fallback sem repetir modelos.
+
+        GEMINI_MODELS tem prioridade e aceita uma lista separada por vírgulas.
+        Sempre anexamos os modelos padrão de fallback ao final (sem duplicar)
+        para garantir resiliência caso os modelos configurados no ambiente
+        estejam sobrecarregados ou lentos.
+        """
+        configured = self._split_models(os.environ.get("GEMINI_MODELS", ""))
+        candidates = [*configured, *DEFAULT_FALLBACK_MODELS] if configured else [default_model, *DEFAULT_FALLBACK_MODELS]
+        models = []
+        for candidate in candidates:
+            if candidate not in models:
+                models.append(candidate)
+        return models
+
+    def _model_candidates(self, requested_model: Optional[str]) -> List[str]:
+        if not requested_model:
+            return self.models
+        return [requested_model, *(model for model in self.models if model != requested_model)]
+
+    @staticmethod
+    def _retry_after_seconds(error: urllib.error.HTTPError, body: str) -> float:
+        """Usa a orientação do servidor quando ela estiver disponível."""
+        retry_after = error.headers.get("Retry-After") if error.headers else None
+        if retry_after:
+            try:
+                return max(1.0, float(retry_after))
+            except ValueError:
+                try:
+                    return max(1.0, email.utils.parsedate_to_datetime(retry_after).timestamp() - time.time())
+                except (TypeError, ValueError):
+                    pass
+        retry_match = re.search(r'"retryDelay"\s*:\s*"([0-9.]+)s"', body)
+        return max(1.0, float(retry_match.group(1))) if retry_match else 60.0
+
+    @staticmethod
+    def _is_account_quota_exhausted(body: str) -> bool:
+        """Distingue quota da conta/projeto de limite temporário de um modelo."""
+        normalized = body.lower()
+        markers = (
+            "exceeded your current quota",
+            "check your plan and billing",
+            "daily quota",
+            "quota_exceeded",
+            "prepayment credits",
+            "credits are depleted",
+        )
+        return any(marker in normalized for marker in markers)
+
+    @staticmethod
+    def _is_key_fatal_error(status_code: int, body: str) -> bool:
+        """Identifica erros vinculados à chave/conta (402 créditos esgotados, 401/403, API key inválida).
+
+        Nesses casos a chave deve ser isolada em cooldown global e o pool precisa
+        continuar imediatamente para a próxima chave de fallback, sem abortar a requisição.
+        """
+        if status_code in (401, 402, 403):
+            return True
+        if status_code == 400:
+            normalized = body.lower()
+            markers = (
+                "api_key_invalid",
+                "api key not valid",
+                "api key expired",
+                "invalid api key",
+                "prepayment credits",
+                "billing",
+            )
+            return any(marker in normalized for marker in markers)
+        return False
+
+    @staticmethod
+    def _extract_consumer(body: str) -> str:
+        """Extrai o identificador de projeto/consumer a partir de detalhes de erro RPC."""
+        try:
+            data = json.loads(body)
+            details = data.get("error", {}).get("details", [])
+            for item in details:
+                if isinstance(item, dict):
+                    consumer = item.get("metadata", {}).get("consumer", "")
+                    if consumer:
+                        return str(consumer).strip()
+        except Exception:
+            pass
+        match = re.search(r'"consumer"\s*:\s*"([^"]+)"', body)
+        return match.group(1).strip() if match else ""
+
+    @property
+    def total_keys(self) -> int:
+        return len(self._keys)
+
+    def is_key_available(self, candidate: KeyState, model: Optional[str] = None) -> bool:
+        if not candidate.is_available_for(model):
+            return False
+        if candidate.consumer:
+            now = time.time()
+            if now < self._consumer_cooldown_until.get((candidate.consumer, None), 0.0):
+                return False
+            if model and now < self._consumer_cooldown_until.get((candidate.consumer, model), 0.0):
+                return False
+        return True
+
+    def get_available_key(
+        self, max_wait_seconds: float = 30.0, model: Optional[str] = None
+    ) -> Tuple[Optional[KeyState], str]:
+        """Obtém a próxima chave disponível via Round-Robin sem bloquear o lock durante sleep."""
+        start_time = time.time()
+        while time.time() - start_time <= max_wait_seconds:
+            with self.lock:
+                if not self._keys:
+                    return None, "Nenhuma chave registrada no pool."
+
+                # Tenta encontrar uma chave pronta
+                for _ in range(len(self._keys)):
+                    candidate = self._keys[self._current_index]
+                    self._current_index = (self._current_index + 1) % len(self._keys)
+                    if self.is_key_available(candidate, model):
+                        return candidate, ""
+
+                # Se todas estiverem em cooldown, calcula o menor tempo de espera
+                now = time.time()
+                wait_times = []
+                for k in self._keys:
+                    key_until = max(k.cooldown_until, k.model_cooldown_until.get(model, 0.0)) if model else k.cooldown_until
+                    if k.consumer:
+                        key_until = max(
+                            key_until,
+                            self._consumer_cooldown_until.get((k.consumer, None), 0.0),
+                            self._consumer_cooldown_until.get((k.consumer, model), 0.0) if model else 0.0,
+                        )
+                    wait_times.append(key_until - now)
+                min_wait = min(wait_times)
+
+            if min_wait <= 0:
+                continue
+            if min_wait > (max_wait_seconds - (time.time() - start_time)):
+                break
+            time.sleep(min(min_wait + 0.1, 2.0))
+
+        return None, "Todas as chaves do pool estão em cooldown/rate limit."
+
+    def generate_content(
+        self,
+        prompt: str = "",
+        parts: Optional[List[Dict[str, Any]]] = None,
+        system_instruction: Optional[str] = None,
+        json_mode: bool = False,
+        model: Optional[str] = None,
+        temperature: float = 0.2,
+        max_retries: int = 4,
+        timeout: int = 25,
+        max_total_seconds: Optional[float] = None,
+        thinking_budget: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Executa uma chamada ao Gemini com fallback automático entre chaves e modelos.
+        Suporta chamadas de texto puro (via prompt) ou multimodais (via parts contendo inlineData).
+        Retorna dicionário contendo 'text', 'raw_response', e 'key_index'.
+        """
+        conteudo_parts = parts if parts is not None else [{"text": prompt}]
+        payload: Dict[str, Any] = {
+            "contents": [{"parts": conteudo_parts}],
+            "generationConfig": {
+                "temperature": temperature
+            }
+        }
+        if thinking_budget is not None and thinking_budget > 0:
+            payload["generationConfig"]["thinkingConfig"] = {
+                "thinkingBudget": thinking_budget
+            }
+        if json_mode:
+            payload["generationConfig"]["responseMimeType"] = "application/json"
+        if system_instruction:
+            payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
+
+        body = json.dumps(payload).encode("utf-8")
+        last_exception = None
+        deadline = time.monotonic() + max_total_seconds if max_total_seconds else None
+
+        for target_model in self._model_candidates(model):
+            if deadline and time.monotonic() >= deadline:
+                break
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent"
+            logger.info("[GeminiPool] Tentando modelo %s.", target_model)
+
+            # Pelo menos uma tentativa por chave: assim contas independentes não são
+            # descartadas apenas porque uma chave anterior atingiu seu limite.
+            attempts_for_model = max(max_retries, len(self._keys))
+            timeouts_in_model = 0
+            transient_errors_in_model = 0
+            for _ in range(attempts_for_model):
+                if deadline and time.monotonic() >= deadline:
+                    last_exception = TimeoutError("Orcamento total do provedor Gemini esgotado.")
+                    break
+                # Não aguarda uma chave que já está em cooldown: tenta o próximo modelo.
+                key_state, err_msg = self.get_available_key(max_wait_seconds=0.1, model=target_model)
+                if not key_state:
+                    last_exception = RuntimeError(err_msg)
+                    logger.warning("[GeminiPool] Modelo %s indisponível: %s", target_model, err_msg)
+                    break
+
+                req = urllib.request.Request(
+                    url,
+                    data=body,
+                    headers={"Content-Type": "application/json", "x-goog-api-key": key_state.key}
+                )
+
+                try:
+                    request_timeout = timeout
+                    if deadline:
+                        remaining = deadline - time.monotonic()
+                        if remaining < 1.5:
+                            last_exception = TimeoutError("Orcamento total do provedor Gemini esgotado.")
+                            break
+                        request_timeout = min(timeout, remaining)
+                    with urllib.request.urlopen(req, timeout=request_timeout) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        key_state.mark_success(target_model)
+                        candidates = data.get("candidates", [])
+                        if not candidates:
+                            raise ValueError(f"Resposta vazia ou bloqueada por filtro de segurança: {data}")
+                        resp_parts = candidates[0].get("content", {}).get("parts", [])
+                        text_chunks = [
+                            p.get("text", "")
+                            for p in resp_parts
+                            if isinstance(p, dict) and not p.get("thought", False) and p.get("text")
+                        ]
+                        text = "\n".join(text_chunks).strip()
+                        if not text and resp_parts:
+                            text = resp_parts[-1].get("text", "")
+                        return {"text": text, "raw": data, "key_index": key_state.index, "model": target_model}
+
+                except urllib.error.HTTPError as e:
+                    try:
+                        err_body = e.read().decode("utf-8")
+                    except Exception:
+                        err_body = ""
+                    if self._is_key_fatal_error(e.code, err_body):
+                        # Chave sem créditos (402), bloqueada/revogada (401/403) ou inválida (400):
+                        # isola a chave globalmente e tenta imediatamente a próxima chave do pool.
+                        cooldown_seconds = float(os.environ.get("GEMINI_ACCOUNT_QUOTA_COOLDOWN", "86400"))
+                        consumer = self._extract_consumer(err_body)
+                        if consumer:
+                            key_state.consumer = consumer
+                            with self.lock:
+                                self._consumer_cooldown_until[(consumer, None)] = time.time() + cooldown_seconds
+                                for other_key in self._keys:
+                                    if other_key.consumer == consumer:
+                                        other_key.mark_rate_limit(
+                                            cooldown_seconds=cooldown_seconds,
+                                            reason=f"HTTP {e.code} na conta/chave ({err_body[:100]})",
+                                            model=None,
+                                        )
+                        else:
+                            key_state.mark_rate_limit(
+                                cooldown_seconds=cooldown_seconds,
+                                reason=f"HTTP {e.code} na chave ({err_body[:100]})",
+                                model=None,
+                            )
+                        last_exception = RuntimeError(f"Chave #{key_state.index} rejeitada (HTTP {e.code}): {err_body[:200]}")
+                        continue
+                    if e.code == 429 or "RESOURCE_EXHAUSTED" in err_body:
+                        cooldown_seconds = self._retry_after_seconds(e, err_body)
+                        quota_is_global = self._is_account_quota_exhausted(err_body)
+                        # Quota diária/financeira pertence à conta da chave, não ao
+                        # modelo. Evita desperdiçar chamadas nos demais fallbacks.
+                        if quota_is_global:
+                            cooldown_seconds = max(cooldown_seconds, float(os.environ.get("GEMINI_ACCOUNT_QUOTA_COOLDOWN", "86400")))
+
+                        consumer = self._extract_consumer(err_body)
+                        if consumer:
+                            key_state.consumer = consumer
+                            with self.lock:
+                                self._consumer_cooldown_until[(consumer, None if quota_is_global else target_model)] = (
+                                    time.time() + cooldown_seconds
+                                )
+                                for other_key in self._keys:
+                                    if other_key.consumer == consumer:
+                                        other_key.mark_rate_limit(
+                                            cooldown_seconds=cooldown_seconds,
+                                            reason=f"Consumer {consumer} rate limit",
+                                            model=None if quota_is_global else target_model,
+                                        )
+                        else:
+                            key_state.mark_rate_limit(
+                                cooldown_seconds=cooldown_seconds,
+                                reason=f"HTTP 429 ({err_body[:100]})",
+                                model=None if quota_is_global else target_model,
+                            )
+                        last_exception = RuntimeError(f"Rate limit na chave #{key_state.index}: {err_body[:200]}")
+                        continue
+                    if e.code == 404:
+                        key_state.mark_error(f"Modelo indisponível: HTTP {e.code}", model=target_model)
+                        last_exception = RuntimeError(f"Modelo {target_model} indisponível: {err_body[:200]}")
+                        break
+                    if e.code in (500, 503, 504):
+                        transient_errors_in_model += 1
+                        key_state.mark_error(f"HTTP {e.code}", cooldown_seconds=60.0, model=target_model)
+                        last_exception = RuntimeError(f"Erro no servidor Gemini ({e.code}): {err_body[:200]}")
+                        if transient_errors_in_model >= 2:
+                            logger.warning(
+                                "[GeminiPool] Modelo %s retornou HTTP %s em %d chaves seguidas. Avançando para próximo modelo.",
+                                target_model,
+                                e.code,
+                                transient_errors_in_model,
+                            )
+                            break
+                        time.sleep(0.3)
+                        continue
+                    key_state.mark_error(f"HTTP {e.code}: {err_body[:100]}", model=target_model)
+                    raise RuntimeError(f"Erro na API Gemini ({e.code}): {err_body}")
+
+                except Exception as e:
+                    is_timeout = any(kw in str(e).lower() for kw in ["timed out", "timeout"])
+                    key_state.mark_error(str(e), cooldown_seconds=120.0 if is_timeout else 60.0, model=target_model)
+                    last_exception = e
+                    time.sleep(0.2)
+                    if is_timeout:
+                        timeouts_in_model += 1
+                        # 1 timeout pode ser isolado em uma chave; 2 timeouts no mesmo modelo
+                        # indicam degradação do modelo — avança para o próximo fallback.
+                        if timeouts_in_model >= 2:
+                            logger.warning(
+                                "[GeminiPool] Timeout repetido no modelo %s (%d chaves). Tentando próximo modelo de fallback.",
+                                target_model,
+                                timeouts_in_model,
+                            )
+                            break
+
+        raise RuntimeError(
+            f"Nenhum modelo do pool respondeu após os fallbacks {self._model_candidates(model)}. "
+            f"Último erro: {last_exception}"
+        )
+
+    def generate_batch_parallel(
+        self,
+        items: List[Any],
+        process_item_fn: Callable[[Any, "GeminiPool"], Any],
+        max_workers: Optional[int] = None
+    ) -> List[Any]:
+        """
+        Processa uma lista de itens em paralelo, distribuindo a carga de forma equilibrada
+        entre todas as chaves do pool.
+        """
+        num_keys = max(1, len(self._keys))
+        # Otimiza o número de threads com base no número de chaves disponíveis
+        workers = max_workers or min(num_keys * 3, 18)
+        results = [None] * len(items)
+
+        def _worker(idx: int, item: Any):
+            res = process_item_fn(item, self)
+            return idx, res
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(_worker, i, it) for i, it in enumerate(items)]
+            for future in as_completed(futures):
+                try:
+                    idx, res = future.result()
+                    results[idx] = res
+                except Exception as e:
+                    logger.error(f"[GeminiPool Batch] Erro ao processar item: {e}")
+
+        return results
+
+    def health_check(self) -> Dict[str, Any]:
+        """Executa um ping de validação em todas as chaves cadastradas."""
+        report = []
+        for state in self._keys:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.default_model}:generateContent"
+            payload = {"contents": [{"parts": [{"text": "ping"}]}]}
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers={"Content-Type": "application/json", "x-goog-api-key": state.key}
+            )
+            t0 = time.time()
+            try:
+                with urllib.request.urlopen(req, timeout=5):
+                    latency = (time.time() - t0) * 1000
+                    report.append({
+                        "key_index": state.index,
+                        "key_prefix": state.key[:10] + "...",
+                        "status": "HEALTHY",
+                        "latency_ms": round(latency, 1),
+                        "total_calls": state.total_calls,
+                        "success_calls": state.success_calls,
+                        "error_calls": state.error_calls
+                    })
+            except Exception as e:
+                report.append({
+                    "key_index": state.index,
+                    "key_prefix": state.key[:10] + "...",
+                    "status": "UNHEALTHY",
+                    "error": str(e),
+                    "total_calls": state.total_calls,
+                    "success_calls": state.success_calls,
+                    "error_calls": state.error_calls
+                })
+        return {
+            "model": self.default_model,
+            "total_keys": len(self._keys),
+            "keys_report": report
+        }
+
+
+# Instância Singleton global para uso em todo o backend
+gemini_pool = GeminiPool()
+
+
+def get_gemini_pool() -> GeminiPool:
+    """Retorna a instância singleton do GeminiPool."""
+    return gemini_pool
+
+
+DEFAULT_PROVIDER_ORDER = ("gemini",)
+DEFAULT_GLOBAL_TIMEOUT_BUDGET = 30.0
+DEFAULT_PROVIDER_TIMEOUT = 10.0
+
+
+class CircuitBreaker:
+    """Circuit Breaker defensivo em memória para proteger workers contra degradação de IA externa."""
+
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 30.0):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.failure_count = 0
+        self.last_failure_time = 0.0
+        self.state = "CLOSED"
+        self.lock = threading.Lock()
+
+    def can_execute(self) -> bool:
+        now = time.time()
+        with self.lock:
+            if self.state == "OPEN":
+                if now - self.last_failure_time >= self.recovery_timeout:
+                    self.state = "HALF_OPEN"
+                    return True
+                return False
+            return True
+
+    def record_success(self):
+        with self.lock:
+            self.failure_count = 0
+            self.state = "CLOSED"
+
+    def record_failure(self):
+        now = time.time()
+        with self.lock:
+            self.failure_count += 1
+            self.last_failure_time = now
+            if self.failure_count >= self.failure_threshold:
+                self.state = "OPEN"
+                logger.warning(
+                    "[CircuitBreaker] Circuito aberto por %.0fs após %d falhas consecutivas.",
+                    self.recovery_timeout,
+                    self.failure_count,
+                )
+
+    def reset(self):
+        with self.lock:
+            self.failure_count = 0
+            self.last_failure_time = 0.0
+            self.state = "CLOSED"
+
+
+circuit_breaker = CircuitBreaker()
+
+
+def _valid_text(text: Any, validator: Optional[Callable[[str], bool]]) -> bool:
+    return isinstance(text, str) and bool(text.strip()) and (validator is None or validator(text.strip()))
+
+
+def generate_content_with_fallback(
+    prompt: str,
+    system_instruction: Optional[str] = None,
+    json_mode: bool = False,
+    temperature: float = 0.2,
+    timeout: Optional[int] = None,
+    response_validator: Optional[Callable[[str], bool]] = None,
+    provider_order: Optional[List[str] | Tuple[str, ...]] = None,
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Gera conteúdo via Google Gemini Pool com controle de timeout, validação e Circuit Breaker."""
+    if provider_order is not None:
+        providers = [p.lower() for p in provider_order if p.lower() in DEFAULT_PROVIDER_ORDER]
+        if not providers:
+            raise RuntimeError("Nenhum provedor válido configurado (esperado: gemini).")
+
+    if gemini_pool.total_keys <= 0:
+        raise RuntimeError("Todos os provedores de IA falharam (nenhuma chave Gemini disponível).")
+
+    if not circuit_breaker.can_execute():
+        logger.warning("[GeminiPool] Circuit breaker ativado (Fast-Fail). Rejeitando chamada de IA.")
+        raise RuntimeError("Todos os provedores de IA falharam (circuito aberto - Fast-Fail).")
+
+    configured_provider_timeout = max(
+        1.0,
+        float(os.environ.get("AI_PROVIDER_TIMEOUT", str(DEFAULT_PROVIDER_TIMEOUT))),
+    )
+    provider_timeout = float(timeout) if timeout is not None else configured_provider_timeout
+    per_request_timeout = max(8, min(15, int(provider_timeout * 0.65)))
+    max_budget = min(float(provider_timeout * 1.5), 28.0) if timeout is not None else 28.0
+    max_total_seconds = max(provider_timeout, max_budget)
+
+    try:
+        response = gemini_pool.generate_content(
+            prompt=prompt,
+            system_instruction=system_instruction,
+            json_mode=json_mode,
+            model=model,
+            temperature=temperature,
+            timeout=per_request_timeout,
+            max_total_seconds=max_total_seconds,
+        )
+        text = response.get("text", "")
+        if _valid_text(text, response_validator):
+            circuit_breaker.record_success()
+            return {
+                "text": text.strip(),
+                "source": "gemini",
+                "model": response.get("model", "gemini"),
+            }
+        logger.warning("[GeminiPool] Gemini retornou resposta vazia ou rejeitada pelo validador.")
+        circuit_breaker.record_failure()
+    except Exception as error:
+        circuit_breaker.record_failure()
+        logger.warning("[GeminiPool] Gemini falhou: %s", error)
+
+    raise RuntimeError("Todos os provedores de IA falharam (gemini).")
+
+
+def provider_status() -> Dict[str, Any]:
+    """Retorna configuração operacional e cooldowns reais sem revelar chaves ou segredos."""
+    now = time.time()
+    cooldowns = []
+    primary_model = gemini_pool.models[0] if gemini_pool.models else None
+    available_keys = 0
+    for state in gemini_pool._keys:
+        if gemini_pool.is_key_available(state, primary_model):
+            available_keys += 1
+        if state.cooldown_until > now:
+            cooldowns.append({
+                "provider": "gemini",
+                "key_index": state.index,
+                "model": "all",
+                "remaining_seconds": round(state.cooldown_until - now),
+                "reason": state.last_error[:120] if state.last_error else "",
+            })
+        for model_name, until in state.model_cooldown_until.items():
+            if until > now:
+                cooldowns.append({
+                    "provider": "gemini",
+                    "key_index": state.index,
+                    "model": model_name,
+                    "remaining_seconds": round(until - now),
+                    "reason": state.last_error[:120] if state.last_error else "",
+                })
+
+    return {
+        "order": list(DEFAULT_PROVIDER_ORDER),
+        "providers": {
+            "gemini": {
+                "configured": gemini_pool.total_keys > 0,
+                "keys": gemini_pool.total_keys,
+                "available_keys": available_keys,
+                "models": list(gemini_pool.models),
+            },
+        },
+        "circuit_breaker": {
+            "state": circuit_breaker.state,
+            "failure_count": circuit_breaker.failure_count,
+        },
+        "cooldowns": cooldowns,
+        "timeouts": {
+            "global_budget_seconds": max(
+                1.0,
+                float(os.environ.get("AI_GLOBAL_TIMEOUT_BUDGET", str(DEFAULT_GLOBAL_TIMEOUT_BUDGET))),
+            ),
+            "provider_timeout_seconds": max(
+                1.0,
+                float(os.environ.get("AI_PROVIDER_TIMEOUT", str(DEFAULT_PROVIDER_TIMEOUT))),
+            ),
+        },
+    }
+

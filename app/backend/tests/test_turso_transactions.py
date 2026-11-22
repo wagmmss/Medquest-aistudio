@@ -1,0 +1,346 @@
+import pytest
+
+from api.db import TursoConnection, db_transaction
+
+
+class FakeCursor:
+    def __init__(self, rows_affected=1):
+        self.description = []
+        self.rowcount = rows_affected
+        self.lastrowid = None
+        self.closed = False
+
+    def fetchone(self):
+        return None
+
+    def fetchall(self):
+        return []
+
+    def close(self):
+        self.closed = True
+
+
+class FakeClient:
+    def __init__(self):
+        self.statements = []
+        self.committed = False
+        self.rolled_back = False
+        self.last_cursor = None
+
+    def execute(self, sql, args=()):
+        self.statements.append((sql, list(args)))
+        self.last_cursor = FakeCursor()
+        return self.last_cursor
+
+    def commit(self):
+        self.committed = True
+
+    def rollback(self):
+        self.rolled_back = True
+
+    def close(self):
+        pass
+
+
+class StaleStreamClient(FakeClient):
+    def __init__(self):
+        super().__init__()
+        self.closed = False
+
+    def execute(self, sql, args=()):
+        self.statements.append((sql, list(args)))
+        raise ValueError('Hrana: api error: status=404 Not Found, body={"error":"stream not found"}')
+
+    def close(self):
+        self.closed = True
+
+
+def test_turso_transaction_commits_all_statements_together():
+    client = FakeClient()
+    db = TursoConnection(client)
+
+    with db_transaction(db, immediate=True):
+        db.execute("INSERT INTO attempts VALUES (?)", (1,))
+        db.execute("UPDATE idempotency_keys SET status = ?", ("completed",))
+
+    assert [statement[0] for statement in client.statements] == [
+        "BEGIN IMMEDIATE",
+        "INSERT INTO attempts VALUES (?)",
+        "UPDATE idempotency_keys SET status = ?",
+    ]
+    assert client.committed is True
+    assert client.rolled_back is False
+    assert db.tx is False
+
+
+def test_turso_transaction_rolls_back_on_failure():
+    client = FakeClient()
+    db = TursoConnection(client)
+
+    with pytest.raises(RuntimeError, match="injected failure"), db_transaction(db):
+        db.execute("INSERT INTO attempts VALUES (?)", (1,))
+        raise RuntimeError("injected failure")
+
+    assert client.committed is False
+    assert client.rolled_back is True
+    assert db.tx is False
+
+
+def test_turso_cursor_closes_underlying_cursor():
+    client = FakeClient()
+    db = TursoConnection(client)
+
+    cursor = db.execute("SELECT 1")
+    cursor.close()
+
+    assert client.last_cursor.closed is True
+
+
+def test_turso_reconnects_and_retries_one_statement_after_stale_stream():
+    stale_client = StaleStreamClient()
+    fresh_client = FakeClient()
+    reconnect_calls = []
+    db = TursoConnection(
+        stale_client,
+        persistent=True,
+        reconnect=lambda failed: reconnect_calls.append(failed) or fresh_client,
+    )
+
+    db.execute("SELECT 1")
+
+    assert reconnect_calls == [stale_client]
+    assert stale_client.statements == [("SELECT 1", [])]
+    assert fresh_client.statements == [("SELECT 1", [])]
+
+
+def test_turso_does_not_retry_stale_stream_inside_a_transaction():
+    client = FakeClient()
+    db = TursoConnection(
+        client,
+        persistent=True,
+        reconnect=lambda _: pytest.fail("a transaction statement must not be replayed"),
+    )
+    db.begin()
+    client.execute = StaleStreamClient().execute
+
+    with pytest.raises(ValueError, match="stream not found"):
+        db.execute("INSERT INTO attempts VALUES (?)", (1,))
+
+    db.rollback()
+
+
+def test_http_turso_url_is_rejected_before_startup(monkeypatch):
+    from api import create_app
+
+    monkeypatch.setenv("TURSO_DATABASE_URL", "https://example.invalid")
+    monkeypatch.setenv("TURSO_AUTH_TOKEN", "secret")
+    with pytest.raises(ValueError, match="must use libsql:// or wss://"):
+        create_app()
+
+
+def test_partial_turso_configuration_is_rejected(monkeypatch):
+    from api import create_app
+
+    monkeypatch.setenv("TURSO_DATABASE_URL", "libsql://example.invalid")
+    monkeypatch.delenv("TURSO_AUTH_TOKEN", raising=False)
+    with pytest.raises(ValueError, match="must be configured together"):
+        create_app()
+
+
+def test_turso_read_batch_retries_after_stale_stream():
+    stale_client = StaleStreamClient()
+    fresh_client = FakeClient()
+    reconnect_calls = []
+    db = TursoConnection(
+        stale_client,
+        persistent=True,
+        reconnect=lambda failed: reconnect_calls.append(failed) or fresh_client,
+    )
+
+    queries = [
+        ("SELECT 1", []),
+        ("SELECT 2", []),
+    ]
+    res = db.batch(queries)
+
+    assert len(res) == 2
+    assert reconnect_calls == [stale_client]
+    assert [s[0] for s in fresh_client.statements] == ["SELECT 1", "SELECT 2"]
+    assert db.tx is False
+
+
+def test_turso_stale_detection_covers_various_disconnects():
+    from api.db import _is_stale_turso_stream
+
+    assert _is_stale_turso_stream(Exception("Stream not found")) is True
+    assert _is_stale_turso_stream(Exception("Hrana: connection closed by peer")) is True
+    assert _is_stale_turso_stream(Exception("websocket transport error")) is True
+    assert _is_stale_turso_stream(Exception("stale baton expired")) is True
+    assert _is_stale_turso_stream(Exception("syntax error near WHERE")) is False
+
+
+class ClientWithExecutemany(FakeClient):
+    def __init__(self):
+        super().__init__()
+        self.executemany_calls = []
+
+    def executemany(self, sql, seq_of_args):
+        self.executemany_calls.append((sql, list(seq_of_args)))
+        self.last_cursor = FakeCursor(rows_affected=len(seq_of_args))
+        return self.last_cursor
+
+
+def test_turso_executemany_dispatches_to_client_executemany():
+    client = ClientWithExecutemany()
+    db = TursoConnection(client)
+
+    params = [("row1", 1), ("row2", 2)]
+    cur = db.executemany("INSERT INTO t VALUES (?, ?)", params)
+
+    assert len(client.executemany_calls) == 1
+    assert client.executemany_calls[0] == ("INSERT INTO t VALUES (?, ?)", [["row1", 1], ["row2", 2]])
+    assert cur.rowcount == 2
+
+
+def test_turso_executemany_falls_back_when_client_lacks_executemany():
+    client = FakeClient()
+    assert not hasattr(client, "executemany")
+    db = TursoConnection(client)
+
+    params = [("a", b"bytes_val"), ("b", "str_val")]
+    cur = db.executemany("INSERT INTO t VALUES (?, ?)", params)
+
+    assert len(client.statements) == 2
+    assert client.statements[0] == ("INSERT INTO t VALUES (?, ?)", ["a", "bytes_val"])
+    assert client.statements[1] == ("INSERT INTO t VALUES (?, ?)", ["b", "str_val"])
+
+
+def test_turso_executemany_retries_after_stale_stream():
+    class StaleStreamExecutemanyClient(ClientWithExecutemany):
+        def executemany(self, sql, seq_of_args):
+            raise ValueError('Hrana: api error: status=404 Not Found, body={"error":"stream not found"}')
+
+    stale_client = StaleStreamExecutemanyClient()
+    fresh_client = ClientWithExecutemany()
+    reconnect_calls = []
+    db = TursoConnection(
+        stale_client,
+        persistent=True,
+        reconnect=lambda failed: reconnect_calls.append(failed) or fresh_client,
+    )
+
+    db.executemany("INSERT INTO t VALUES (?)", [(1,), (2,)])
+
+    assert reconnect_calls == [stale_client]
+    assert len(fresh_client.executemany_calls) == 1
+    assert fresh_client.executemany_calls[0][1] == [[1], [2]]
+
+
+def test_turso_execute_stale_stream_recovery_on_persistent_failure():
+    stale_client1 = StaleStreamClient()
+    stale_client2 = StaleStreamClient()
+    fresh_client = FakeClient()
+
+    clients_sequence = [stale_client2, fresh_client]
+    reconnect_calls = []
+
+    def reconnect_fn(failed):
+        reconnect_calls.append(failed)
+        return clients_sequence.pop(0)
+
+    db = TursoConnection(
+        stale_client1,
+        persistent=True,
+        reconnect=reconnect_fn,
+    )
+
+    with pytest.raises(ValueError, match="stream not found"):
+        db.execute("SELECT 1")
+
+    # Reconnect was called twice:
+    # 1) Inside _execute_with_reconnect after initial query failure
+    # 2) Inside execute() except block after retry query failure, to refresh self.client
+    assert reconnect_calls == [stale_client1, stale_client2]
+    assert db.client is fresh_client
+
+
+def test_turso_execute_stale_stream_recovery_suppresses_reconnect_exception():
+    stale_client1 = StaleStreamClient()
+    stale_client2 = StaleStreamClient()
+
+    reconnect_calls = []
+
+    def reconnect_fn(failed):
+        reconnect_calls.append(failed)
+        if len(reconnect_calls) == 1:
+            return stale_client2
+        raise RuntimeError("Network down during secondary reconnect")
+
+    db = TursoConnection(
+        stale_client1,
+        persistent=True,
+        reconnect=reconnect_fn,
+    )
+
+    # Primary stale stream exception should be re-raised, not the reconnect RuntimeError
+    with pytest.raises(ValueError, match="stream not found"):
+        db.execute("SELECT 1")
+
+    assert reconnect_calls == [stale_client1, stale_client2]
+
+
+def test_turso_executemany_stale_stream_recovery_on_persistent_failure():
+    class StaleStreamExecutemanyClient(ClientWithExecutemany):
+        def executemany(self, sql, seq_of_args):
+            raise ValueError('Hrana: api error: status=404 Not Found, body={"error":"stream not found"}')
+
+    stale1 = StaleStreamExecutemanyClient()
+    stale2 = StaleStreamExecutemanyClient()
+    fresh = ClientWithExecutemany()
+
+    clients = [stale2, fresh]
+    reconnect_calls = []
+
+    def reconnect_fn(failed):
+        reconnect_calls.append(failed)
+        return clients.pop(0)
+
+    db = TursoConnection(
+        stale1,
+        persistent=True,
+        reconnect=reconnect_fn,
+    )
+
+    with pytest.raises(ValueError, match="stream not found"):
+        db.executemany("INSERT INTO t VALUES (?)", [(1,)])
+
+    assert reconnect_calls == [stale1, stale2]
+    assert db.client is fresh
+
+
+def test_turso_executemany_stale_stream_recovery_suppresses_reconnect_exception():
+    class StaleStreamExecutemanyClient(ClientWithExecutemany):
+        def executemany(self, sql, seq_of_args):
+            raise ValueError('Hrana: api error: status=404 Not Found, body={"error":"stream not found"}')
+
+    stale1 = StaleStreamExecutemanyClient()
+    stale2 = StaleStreamExecutemanyClient()
+
+    reconnect_calls = []
+
+    def reconnect_fn(failed):
+        reconnect_calls.append(failed)
+        if len(reconnect_calls) == 1:
+            return stale2
+        raise RuntimeError("Secondary reconnect failure")
+
+    db = TursoConnection(
+        stale1,
+        persistent=True,
+        reconnect=reconnect_fn,
+    )
+
+    with pytest.raises(ValueError, match="stream not found"):
+        db.executemany("INSERT INTO t VALUES (?)", [(1,)])
+
+    assert reconnect_calls == [stale1, stale2]

@@ -1,0 +1,96 @@
+"""Repetição espaçada com FSRS (estado da arte), substituindo o SM-2 simplificado.
+
+Mapeia a resposta da questão para uma nota FSRS:
+  - errou               -> Again
+  - acertou + "chutei"  -> Hard
+  - acertou + "duvida"  -> Good
+  - acertou + "certeza" -> Easy
+  - acertou (sem info)  -> Good
+"""
+import json
+import logging
+from datetime import datetime, timedelta, timezone
+
+from fsrs import Card, Rating, Scheduler
+
+logger = logging.getLogger(__name__)
+
+# Parâmetros padrão do FSRS v6
+_DEFAULT_PARAMS = list(Scheduler().parameters)
+
+# Parâmetros calibrados para questões médicas longas (Opção 2: ciclo semanal, mínimo 7 dias no erro)
+# S0(Again) = 3.5 (~7d), S0(Hard) = 8.0 (~15d), S0(Good) = 18.0 (~34d), S0(Easy) = 40.0 (~76d)
+_QUESTION_PARAMS = list(_DEFAULT_PARAMS)
+_QUESTION_PARAMS[0] = 3.5
+_QUESTION_PARAMS[1] = 8.0
+_QUESTION_PARAMS[2] = 18.0
+_QUESTION_PARAMS[3] = 40.0
+
+# Scheduler para questões de prova (sem passos intradia, retenção alvo 85%, intervalos longos)
+_question_scheduler = Scheduler(
+    parameters=_QUESTION_PARAMS,
+    desired_retention=0.85,
+    learning_steps=(),
+    relearning_steps=(),
+    enable_fuzzing=False,
+)
+
+_CONFIDENCE_MAP = {
+    "chutei": Rating.Hard,
+    "duvida": Rating.Good,
+    "certeza": Rating.Easy,
+}
+
+
+def _rating(is_correct, confidence, assisted: bool = False):
+    if not is_correct:
+        return Rating.Again
+    raw_rating = _CONFIDENCE_MAP.get((confidence or "").lower(), Rating.Good)
+    if assisted:
+        # Acerto com ajuda (Dica do Preceptor antes de responder) nunca conta como Easy (Domino +76d).
+        # Se o aluno marcou "certeza" ou "duvida" com dica prévia, o teto pedagógico é Hard (~15d).
+        return Rating.Hard
+    return raw_rating
+
+
+def _safe_load_card(card_json: str | None) -> Card:
+    """Carrega um Card FSRS a partir do JSON de forma defensiva.
+
+    Caso o JSON esteja ausente, corrompido, truncado ou com esquema incompatível,
+    regenera um Card padrão limpo, prevenindo erros 500 no fluxo de estudo.
+    """
+    if not card_json:
+        return Card()
+    try:
+        data = json.loads(card_json)
+        if isinstance(data, dict):
+            return Card.from_dict(data)
+        logger.warning("Payload de fsrs_card não é um dicionário JSON válido. Regenerando Card padrão.")
+    except Exception as exc:
+        logger.warning("Falha ao deserializar fsrs_card (%s). Regenerando Card padrão.", exc)
+    return Card()
+
+
+def review(card_json, is_correct, confidence=None, now=None, assisted: bool = False):
+    """Recebe o estado do card (JSON ou None) e devolve (novo_json, próxima_revisão_iso).
+    
+    Aplica clamp defensivo garantindo que qualquer agendamento respeite D+1 (>= 24 horas),
+    blindando contra passos intradia acidentais, drift de relógio ou estados degenerados.
+    """
+    card = _safe_load_card(card_json)
+    now_utc = (now if now is not None else datetime.now(timezone.utc)).astimezone(timezone.utc)
+    card, _log = _question_scheduler.review_card(
+        card,
+        _rating(is_correct, confidence, assisted=assisted),
+        review_datetime=now_utc,
+    )
+
+    # Clamp defensivo: garantia incondicional de D+1 (>= 24 horas)
+    min_due = now_utc + timedelta(days=1)
+    card_due_utc = card.due.astimezone(timezone.utc) if card.due.tzinfo else card.due.replace(tzinfo=timezone.utc)
+    if card_due_utc < min_due:
+        card.due = min_due
+        card_due_utc = min_due
+
+    due_iso = card_due_utc.isoformat()
+    return json.dumps(card.to_dict()), due_iso

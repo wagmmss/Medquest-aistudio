@@ -1,0 +1,437 @@
+# 📜 MedQuest - Changelog de Tarefas Concluídas
+
+Histórico completo de ciclos, sprints e melhorias entregues no repositório.
+
+## [2026-11-17] - Acerto Assistido (`assisted`), Construtor de Sessão em Linguagem Natural, Treino 10q, Toggle Anti-Viés e Refinamento Clinical Calm
+- **Acerto Assistido (`assisted`) e Calibração FSRS v6**: Adicionada migração `018_attempts_assisted.sql`, suporte a `assisted: bool` em `schemas.py`, `questions.py` (`submit_attempt`, `review_fsrs`, `submit_attempts_batch`) e `srs.py` (limitando acertos com `/dica` a `Rating.Hard` para preservar retenção 0.85 e piso D+1 sem inflar intervalos `Easy`), além de desagregação `Correto` vs `Correto com ajuda` em `stats.py`, `PerformanceRadarTab.tsx` e `QuizSessionReportModal.tsx`.
+- **Construtor de Sessão por Linguagem Natural (`QuizFilters.tsx` + `naturalSessionParser.ts`)**: Parser determinístico PT-BR capaz de interpretar comandos clínicos rápidos (ex.: `"15 questões de GO da UNICAMP que errei"`, `"20 de trauma na USP-SP"`, `"10 revisões vencidas de pediatria"`) gerando chips em tempo real e disparo em 1 clique.
+- **Ação Direta `Treinar (10q)` em `/analise`**: Padronizado o atalho `Treinar (10q)` em `CoverageThemesTab.tsx` (prioridades, tabela desktop e cards mobile), `ThemeDetailDrawer.tsx`, `FocusRadarTab.tsx` e `PerformanceRadarTab.tsx`.
+- **Ocultar Estatísticas de Alternativas (`AlternativeList.tsx`)**: Adicionada barra pós-resposta de distribuição percentual das alternativas e indicador de marcação prévia com toggle persistido em `localStorage` (`medquest:hide-alt-stats`) para evitar viés cognitivo durante revisões.
+- **Consistência Visual Clinical Calm & Dados Reais**: Completados os tokens semânticos (`--color-area-*`) em `globals.css`, adicionada agregação real `alt_stats` em `questions.py` (`submit_attempt`) removendo distribuições sintéticas de fallback em `AlternativeList.tsx`, e corrigido o recorte temporal de `assisted_correct` em `PerformanceRadarTab.tsx`.
+- **Linguagem Visual Clinical Calm (Base)**: Atualizado design system (`globals.css`, `layout.tsx`, `Sidebar.tsx`, `TopNav.tsx`) e páginas principais (`DashboardClient`, `QuizFilters`, `SimuladoCockpitHero`, `AnalysisClient`, `CadernoClient`, `OsceHubClient`, `SearchClient`, `PlannerClient`); removidos arrays `weight` explícitos das variable fonts em `layout.tsx` para compatibilidade com Turbopack.
+- **Refatoração & Hardening Backend**: Extraídos `api/services/psychometrics.py`, `api/services/questions_service.py`, `api/osce_physiology.py` e `api/osce_circuit.py`; adicionado fallback resiliente (`_last_known_profile` / `_build_fallback_profile`) em `api/adaptive.py` com testes em `tests/test_planner.py`.
+- **Análise & Diagnóstico (`/analise`)**: Adicionado botão direto **Treinar prioridade (10q)** em `PerformanceRadarTab.tsx`, toggle `Todas` vs `Última tentativa` com CTE `ROW_NUMBER()` em `_get_timeline_data` (`api/stats.py`) e KPIs de ritmo (`Tempo / Questão` e `Tempo Total`).
+- **Estudo Ativo (`/estudar`)**: Criado `LabValuesModal.tsx` offline-first com busca e categorias, controle `Aa` de tamanho da fonte do enunciado em `QuizHeader.tsx`, e **Dica do Preceptor pré-resposta (Attending Tip)** sem spoiler via modo `/dica` em `api/ai.py` e `QuizClient.tsx`.
+
+
+## [2026-11-14] - Sincronização Medquest-aistudio, Hardening de Segurança e Refatoração Arquitetural
+- **Remoção Completa de Flashcards / `/revisao-ativa` no MedQuest**: Removida geração/edição Cloze de flashcards, rota/atalho remanescente `/revisao-ativa` em `app/frontend/public/manifest.json` e chamadas legadas em `OfflinePanel.tsx`, mantendo `api/flashcards.py` isolado conforme arquitetura atual.
+- **Segurança & Diretriz `explanations` Read-Only**: Removidas as rotas e funções `POST /api/questions/<qid>/synthesize_explanation` (`synthesize_question_explanation`), `POST /api/ai/prescribe_study`, `POST /api/ai/analyze-image`, `app/backend/api/medical_vision.py` e `app/backend/api/universal_pool.py`; aplicado `@require_auth` e `get_current_user_id()` em `app/backend/api/ai_routes.py`; adicionada idempotência (`reserve_idempotency` / `complete_idempotency`) nas rotas OSCE `start` e `finish` (`app/backend/api/osce_routes.py`).
+- **Limpeza de Código Morto & Unificação Taxonomia/Planner**: Excluído frontend legado em `app/backend/static/` (preservando `app/backend/static/images/`), scripts obsoletos de geração/cura de cards e cópias duplicadas na raiz (`canonical_modules_170.json`, `canonical_taxonomy_170.json`, `canonical_themes_verified.json`); unificado `_get_planner_metadata` em `app/backend/api/stats.py` via `api.services.planner._load_catalogs`.
+- **Modularização Frontend & Isolamento de Timers**: Criado `SessionTimer.tsx`, extraído `useOsceAudio.ts` de `OsceRoomClient.tsx`, adotado `useOfflineStatus()` em `SimuladoClient.tsx` e `DashboardClient.tsx` e centralizada navegação em `navigation.ts`, eliminando re-renders a cada 1s nas telas de Simulado e OSCE.
+- **Modularização Backend & SQL CTE `/dashboard/summary`**: Criado `app/backend/api/cache.py` (`SimpleTTLCache` compartilhado com chaveamento em tupla corrigindo invalidação de `overview_cache`), consolidadas queries de tentativas em `_fetch_attempt_rollup` (`WITH user_attempts AS ...` CTE) e reuso único de `planner_config` em `dashboard_summary()`, e extraídos `app/backend/api/osce_prompts.py` e `app/backend/api/osce_evaluation.py` a partir de `app/backend/api/osce.py`.
+
+## [2026-11-06] - Racionalização de Overengineering: Quarentena de Scripts e Desacoplamento do OSCE
+- **Expurgo e Quarentena de 374 Scripts Legados (`app/backend/scripts/` e raiz)**:
+  - Auditoria arquitetural de complexidade executada pelo Gemini 4 Argon identificou 382 scripts na pasta de scripts (incluindo 21 variações de sincronizadores com Turso, 50 `check_*.py` avulsos e dezenas de testes soltos).
+  - Análise de árvore sintática (AST) determinou exatamente as dependências ativas dos pipelines (`audit/`, `validate.py`, `sync_db_turso.py`, `check_performance_guardrails.py`, `content_repair.py`, `taxonomy_sync.py`, `extract.py`, etc.).
+  - Moveram-se com segurança 374 scripts legados/one-offs para `archive/legacy_backend_scripts/` e duplicatas de scripts de SO da raiz (`deploy.bat`, `deploy.ps1`, `validate.ps1`) para `archive/legacy_root_scripts/` via `git mv`, preservando 100% do histórico e `git blame`.
+  - A pasta `app/backend/scripts/` foi enxugada de 382 arquivos para apenas os 13 módulos canônicos vitais.
+- **Desacoplamento de Dados Estáticos Clínicos do OSCE (`app/backend/api/osce_data.py`)**:
+  - Extração de 2.816 linhas de dados estáticos em Python (casos clínicos da USP-RP, checklists, baremas, fármacos e procedimentos) para o arquivo canônico desacoplado `app/backend/data/osce/canonical_stations.json` (157 KB).
+  - `app/backend/api/osce_data.py` transformado em um facade leve e seguro com cache em memória via `lru_cache` de apenas 28 linhas, eliminando 2.788 linhas de Python no backend e otimizando o tempo de boot dos workers da API.
+- **Trava de Regressão Anti-Bloat (`app/backend/tests/test_pipeline_registry.py`)**:
+  - Substituída a asserção legada que tolerava inchaço (`total_python_scripts >= 300`) por uma trava estrita anti-bloat (`3 < total_python_scripts < 50`), impedindo regressão ou acúmulo descontrolado de scripts no diretório ativo.
+- **Validação de Estabilidade**:
+  - 100% dos 419 testes do backend aprovados (`pytest`).
+  - Suíte de validação rápida (`./validate.sh fast`) concluída em 1.30s.
+
+## [2026-11-05] - Renderização de Alternativas com Imagem Médica e Dupla Redundância Offline
+- **Diagnóstico & Auditoria Global de Imagens de Questões**:
+  - Identificada a causa raiz da exibição de tags literais HTML `<img src="...">` nas alternativas de questões médicas (como a questão 8920 da USP-SP 2024 de Distócia de Espáduas). O React escapava `{alt.text}` cru nas interfaces de estudo e simulado.
+  - Varredura de 100% das tabelas e colunas do banco de dados SQLite (`medquest.db`): detectadas exatamente 188 alternativas com imagens em 47 questões de alto rendimento da USP-SP (AVC com tomografias, Abdome Agudo com radiografias, Arritmias/PCR com ECG, manobras obstétricas e reanimação neonatal).
+  - Testadas as 188 URLs na AWS S3 (100% ativas com HTTP 200). Baixadas preventivamente todas as 188 imagens para o backend estático local (`app/backend/static/images/medcof/usp_sp/`), garantindo soberania de dados e resiliência offline contra quedas ou restrições de CDN externo.
+- **Componente Canônico de Renderização de Alternativas (`app/frontend/src/components/AlternativeContent.tsx`)**:
+  - Criado o componente unificado `AlternativeContent` com suporte a tags HTML `<img>` e Markdown `![]()`.
+  - Altura e proporção clínica controlada (`max-h-40 sm:max-h-48 md:max-h-56`) para visualização harmônica ao lado do badge da letra da alternativa, sem distorção nem estouro de layout.
+  - Botão de Zoom dedicado no canto da imagem (`Maximize`) com `e.stopPropagation()`, permitindo abrir a imagem em tela cheia no `ImageViewer` sem selecionar acidentalmente a opção.
+  - Efeito visual de eliminação (`isEliminated`): imagem esmaecida em escala de cinza (`opacity-40 grayscale hover:opacity-70`) ao riscar com a tesoura ou atalho de teclado.
+  - Dupla redundância: handler `onError` com fallback automático para `/api/images/medcof/usp_sp/...` caso a URL externa falhe.
+  - Acessibilidade: gerador `getAlternativePlainText` para `aria-label`, substituindo tags de imagem por descrições amigáveis legíveis para sintetizadores de voz.
+- **Integração nas Telas de Estudo e Simulado**:
+  - `app/frontend/src/app/estudar/components/AlternativeList.tsx`: substituição de `{alt.text}` por `AlternativeContent`, integração com `onImageClick` e sanitização de `aria-label`.
+  - `app/frontend/src/app/estudar/QuizClient.tsx`: conexão do callback `onImageClick={setEnlargedImage}` com a lista de alternativas e renderização formatada do padrão de resposta em questões discursivas.
+  - `app/frontend/src/app/simulado/SimuladoClient.tsx`: substituição de `{alt.text}` por `AlternativeContent` e integração com `onImageClick={setEnlargedImage}`.
+  - `app/backend/api/questions.py`: higienização nos snippets de busca FTS5 para remover tags e links de imagem que quebravam a listagem de resultados.
+- **Validação e Testes**:
+  - Suíte completa do backend aprovada (419 testes no `pytest`), compilação TypeScript limpa (`tsc --noEmit`), ESLint zerado e `./validate.sh fast` concluído com sucesso em 11s.
+
+
+## [2026-11-04] - Arrastar Blocos do Planner Entre Semanas e Reordenação Interativa
+- **Persistência Transacional no Backend (`app/backend/api/plan.py` e `schemas.py`)**:
+  - Criado o endpoint `POST /api/planner/move-topic` com schema `PlannerMoveTopicIn` validado via Pydantic (subtema, source_week, target_week, target_index e mode).
+  - Reordenação atômica no banco SQLite/Turso na tabela `planner_schedule`, com recálculo de `display_order` nas semanas afetadas.
+  - Sincronização automática do progresso concluído do tema (`planner_topic_progress`) para a nova semana de destino.
+  - Invalidação de cache do usuário e disparo de evento de observabilidade `planner_topic_moved`.
+- **Preservação de Semanas no Scheduler (`app/backend/api/services/planner.py`)**:
+  - `build_plan_from_schedule` aprimorado para iterar sobre todas as semanas do cronograma (`range(1, num_weeks + 1)`), garantindo que semanas que ficarem temporariamente sem matérias não sumam do plano e possam receber blocos arrastados.
+- **Interface e Interação de Drag & Drop no Frontend (`app/frontend/src/app/planner/PlannerClient.tsx`)**:
+  - Implementado Drag & Drop nativo HTML5 com handle `GripVertical` em cada card de tema (`TopicRow`).
+  - Feedback visual responsivo: item em arraste semitransparente, linha indicadora de inserção entre tópicos, destaque na semana alvo durante o hover.
+  - Drop zone dedicada e acolhedora para semanas de descanso ou sem matérias cadastradas.
+  - Recálculo dinâmico otimista de carga horária semanal (`allocated_hours`), total de temas e progresso concluído.
+  - Badge de aviso caso a carga horária alocada em uma semana ultrapasse a meta recomendada.
+  - Modal acessível "Mover semana" via botão rápido no card, garantindo 100% de usabilidade em celulares, tablets (touch) e navegação por teclado.
+  - Suporte offline transparente com enfileiramento resiliente no `syncManager`.
+- **Suíte de Testes Automatizados (`app/backend/tests/test_planner.py`)**:
+  - Adicionados testes para movimentação de temas entre semanas diferentes, reordenação de itens na mesma semana, preservação de conclusão e manutenção de semanas vazias.
+  - 100% dos testes aprovados (419 testes de backend e lint do frontend zerado; `./validate.sh fast` em 11s).
+
+## [2026-10-28] - Auditoria de Resiliência Concorrente, Blindagem FSRS e Fidelidade Temporal Offline com Gemini 4 Argon
+- **Persistência Segura & Isolamento Transacional LibSQL (`api/db.py`)**:
+  - `TursoCursor`: Métodos `@property def lastrowid` e `@property def rowcount` agora retornam os atributos previamente preservados no construtor antes do fechamento do statement de escrita.
+  - `TursoConnection`: Condicionamento de `close_db` exclusivamente a conexões em transação ativa (`db.tx` ou `in_transaction`), eliminando chamadas de rollback redundantes. Tratamento resiliente de reconexão automática caso o fechamento do canal falhe no meio do rollback.
+- **Blindagem de Símbolos & Imutabilidade Canônica (`api/ai_routes.py`)**:
+  - Correção de `NameError` com a importação de `datetime` e `timezone`.
+  - Blindagem estrita das resoluções canônicas de professores (`canonical_professor_locked`), retornando imediatamente se houver texto cadastrado.
+- **Fidelidade Temporal & Validação Defensiva Contra Clock Skew (`api/schemas.py` e `api/questions.py`)**:
+  - Adicionado campo opcional `answered_at` em `AttemptIn` e `BatchAttemptItem`, permitindo que tentativas resolvidas offline preservem o instante real da resolução no histórico.
+  - Implementada a função `_resolve_answered_at()` com *clamp* defensivo que rejeita relógio adiantado no cliente (limitando ao instante atual do servidor) e descarta datas anteriores a 30 dias.
+  - `_process_single_attempt` e `submit_attempt` atualizados para gravar o timestamp de resolução observado.
+- **Resiliência do Simulado & Fim do Avanço Duplo do FSRS (`app/frontend/src/app/simulado/SimuladoClient.tsx`)**:
+  - Modo Treino (`feedbackMode === "practice"`): `submitSimulado()` filtra questões já submetidas individualmente em tempo real contra `resultsMap`, prevenindo duplicação de tentativas no banco e avanço duplo do scheduler FSRS.
+  - Fallback Offline: Remoção do fallback cego `|| "A"` em `handleSyncSuccess`, corrigindo a avaliação de acerto e evitando falso gabarito.
+  - Correção Temporal: Em `resumeSimulado()`, ajuste do cálculo de `plannedDurationSeconds` para utilizar segundos em vez de milissegundos.
+- **Fórmula de Prioridade com Cobertura Real no Motor Adaptativo (`api/adaptive.py`)**:
+  - `rank_adaptive_candidates`: `topic_totals` atualizado para computar `[attempts, correct, available, answered]`.
+  - Cálculo e repasse da taxa de cobertura real (`topic_coverage = topic_answered / topic_available`) como 4º argumento de `topic_priority` tanto para questões regulares quanto para questões gêmeas, eliminando a penalidade fixa de `coverage=0.0`.
+- **Prevenção de Write-on-GET e Segurança Clínica no OSCE (`api/osce.py`)**:
+  - `seed_osce_stations`: Adicionada verificação prévia de contagem antes de abrir transação de escrita, eliminando contenção desnecessária em `GET /osce/stations`.
+  - `ClinicalSafetyGuard`: Criada função `_has_affirmative_mention()` que analisa janela sintática de negação precedente (`"nao"`, `"nunca"`, `"jamais"`, `"contraindicad"`, `"sem"`), evitando punir candidatos que verbalizam contraindicações.
+  - Harmonização do catálogo de Hipercalemia Grave aceitando `"Soro Glicosado 50%"` e variantes cadastradas na prancheta.
+- **Validação Automatizada**:
+  - `./validate.sh fast` 100% aprovado (114 testes de backend e lint do frontend em 18.50s).
+
+## [2026-10-16] - Priorização Inteligente de Questões por Bancas-Alvo da Residência com Gemini 4 Argon
+- **Arquitetura de Extração e Resolução de Bancas-Alvo (`api/filters.py` e `api/edital_profiles.py`)**:
+  - Implementada a função `get_user_target_institutions(db, user_id)` para extrair de forma resiliente as faculdades/bancas selecionadas pelo aluno no Planejador de Residência (`planner_config.target_institution`).
+  - Expansão do dicionário canônico `INSTITUTION_ALIASES` cobrindo variantes históricas e sazonais para ENARE, SCMSP, IAMSPE, AMRIGS, SUS-SP, UNICAMP, UNIFESP, USP-SP e USP-RP.
+- **Amostragem Estratificada com Blend 40/60 e Fallback Gracioso (`api/questions.py` e `api/filters.py`)**:
+  - Implementada a função `_sample_prioritized_ids` com constante `TARGET_INSTITUTION_RATIO = 0.40`.
+  - Quando o usuário estuda sem restringir a uma única instituição, a fila reserva ~40% das vagas para as faculdades que ele definiu como objetivos na residência, complementando os 60% restantes com outras bancas para máxima diversidade pedagógica e amplitude de cobrança.
+  - Se a banca-alvo não possuir questões suficientes no subtema solicitado, ativa-se o fallback automático preenchendo a fila com outras bancas sem deixar vagas vazias.
+  - Se o usuário filtrar explicitamente por uma instituição na interface, o filtro estrito é 100% respeitado sem interrupções.
+- **Integração no Motor Adaptativo FSRS e Treino de Recuperação (`api/adaptive.py` e `api/remediation.py`)**:
+  - `rank_adaptive_candidates`: Adicionado `target_institution_boost: 25.0` nos perfis adaptativos (`balanced`, `retention` e `coverage`), priorizando questões inéditas e questões gêmeas das faculdades-alvo sem sobrepor revisões críticas do FSRS.
+  - `generate_remediation_queue`: Priorização de questões erradas e gêmeas inéditas das bancas-alvo na ordenação dos subtemas críticos.
+- **Metadados e Identidade Visual no Frontend (`app/frontend/src/`)**:
+  - Injeção da flag booleana `is_target_institution` em `/questions`, `/questions/:id` e `/questions/batch`.
+  - `QuizClient.tsx`: Badge `🎯 Alvo Residência` exibido em destaque no cabeçalho de cada questão pertencente às faculdades-alvo.
+  - `QuizFilters.tsx`: No seletor de instituições, exibição de indicador de foco automático `🎯 Priorizando suas bancas-alvo (~40%)` e identificadores visuais nas opções das bancas cadastradas.
+  - `lib/api.ts`: Preservação e ordenação preferencial da flag `is_target_institution` no fallback offline via IndexedDB/Dexie.
+- **Testes Unitários e de Integração (`tests/test_target_institution_study.py`)**:
+  - Suíte completa de 6 testes verificando extração, resolução de aliases, proporção 40/60, fallback em subtemas escassos, resposta de rota e boost adaptativo (100% aprovado; 416/416 testes de backend e lint do frontend zerado).
+
+## [2026-10-16] - Padronização Canônica de Comentários, Sanitização de Medway e Reclassificação dos 170 Temas com Gemini 4 Argon
+- **Saneamento da Anomalia de Armazenamento no QID 35998**:
+  - Extração cirúrgica de imagem em `base64` de 2,62 MB codificada no texto para arquivo PNG estático preservado (`app/backend/static/images/q35998_explanation.png` e `app/frontend/public/images/q35998_explanation.png`).
+  - Redução drástica do tamanho do registro no banco SQLite de 2.629.701 caracteres para 9.756 caracteres (redução de 99,6% de overhead de rede e disco).
+- **Sanitização Determinística de Referências Textuais a "Medway" (`scripts/sanitize_medway.py`)**:
+  - Aplicação de algoritmo léxico com *Token-Lock* em 12.569 questões candidatas.
+  - 1.388 ocorrências em prosa/texto ("Família Medway", "aluno Medway", "Gabarito da Medway") substituídas por terminologia neutra e institucional ("comunidade MedQuest", "aluno MedQuest", "Gabarito Comentado MedQuest").
+  - Blindagem e verificação criptográfica de 17.433 URLs de imagens de exames clínicos (`cdn.medway.com.br`, S3), garantindo **100% de paridade e zero quebra de imagens**.
+- **Reclassificação Integral dos 170 Temas Canônicos Oficiais (`scripts/map_legacy_subtemas_argon.py` e `scripts/apply_canonical_taxonomy.py`)**:
+  - Mapeamento via **Gemini 4 Argon** de 302 subtemas legados e fragmentados diretamente para a taxonomia canônica de 170 temas de residência médica (`app/backend/data/taxonomy.json` e `docs/de_para_temas.md`).
+  - Reclassificação de 13.537 questões, elevando a aderência do banco MedQuest para **100,00% (42.827/42.827 questões em temas canônicos oficiais)**, preservando o histórico em `subtema_orig`.
+  - Correção de 21 incongruências severas de `topic` (ex: questões de pneumonia ou nódulo de tireoide em homens com tópico rotulado erroneamente como "Sala de Parto" ou "Gestação").
+- **Motor de Enriquecimento Cirúrgico de Distratores com Gemini 4 Argon (`scripts/surgical_infill_precision.py`)**:
+  - Escalado para 25 workers paralelos no Google Cloud GCP, processando com altíssima velocidade e mantendo o padrão-ouro de residência médica (R1 USP, ENARE, UNICAMP).
+  - Conclusão de 100% dos distratores pendentes: **0 questões com distratores vazios restantes em todo o banco de 42.827 questões**.
+  - Preservação estrita das 20.664 URLs de imagens médicas com verificação de paridade antes do commit transacional.
+  - Validação completa com `./validate.sh fast` aprovada em 11.06s (49 testes de backend e 14 arquivos de lint).
+
+## [2026-10-16] - Repaginação Geral da UI/UX: Clinical Precision Workspace & Anti-Slop Architecture
+- **Fundação de Design System & Tokens Tailwind v4 (`app/frontend/src/app/globals.css`)**:
+  - Implementação de paletas clínicas duplas sem gradientes genéricos:
+    - *Ambulatório Paper* (modo claro / base): `--color-canvas: #f8fafc`, `--color-surface: #ffffff`, `--color-ink-primary: #0f172a`, `--color-ink-secondary: #475569`, `--color-ink-tertiary: #94a3b8`, `--color-line-subtle: #e2e8f0`, `--color-line-crisp: #cbd5e1`, `--color-accent: #0284c7`.
+    - *Radiology Dark OLED* (modo escuro `.dark`): `--color-canvas: #090d16`, `--color-surface: #0f172a`, `--color-ink-primary: #f8fafc`, `--color-ink-secondary: #94a3b8`, `--color-ink-tertiary: #475569`, `--color-line-subtle: #1e293b`, `--color-line-crisp: #334155`, `--color-accent: #38bdf8`.
+  - Tipografia de precisão clínica com hairline borders de 1px, cantos calibrados (`--radius-xs: 2px`, `--radius-sm: 4px`), fonte mono laboratorial (`font-mono-lab: "JetBrains Mono", ui-monospace, monospace`) com `tabular-nums` para cronômetros, dosagens e telemetria.
+- **Erradicação Total do Material Symbols WebFont & Criação do `<ClinicalIcon />`**:
+  - Substituição de ~180KB da webfont pesada do Google Fonts pelo componente ultraleve e tipado `ClinicalIcon.tsx`, baseado em SVGs inline tree-shaken do `lucide-react`, eliminando riscos de FOUT (Flash of Unstyled Text) e requisições bloqueantes.
+  - Varredura e higienização em todos os componentes auxiliares (`AnalysisClient.tsx`, `AuthSync.tsx`, `ImageViewer.tsx`, `DemoBanner.tsx`, `globals.css`).
+- **Navegação & Cockpit Clínico (`app/frontend/src/components/`, `DashboardClient.tsx`)**:
+  - `BottomNav.tsx`: Dock inferior ergonômico ("Thumb-Zone") para médicos em plantão e internato com toque tátil imediato e badge de pendências.
+  - `Sidebar.tsx` e `TopNav.tsx`: Navegação desktop sóbria com switcher de tema (Automático / Claro / Escuro), badges de banca (FMRP-USP, ENARE, UNICAMP) e métricas de plantão em `font-mono-lab`.
+  - `PreceptorFocusCard.tsx` e `DashboardClient.tsx`: Painel de prescrição de estudos com radar de fraquezas e telemetria FSRS.
+- **Módulo de Resolução de Questões (`src/app/estudar/`)**:
+  - Layout Split-Pane Desktop responsivo (12 colunas: enunciado e imagens médicas à esquerda; alternativas, confirmação e gabarito comentada à direita com dock sticky), eliminando rolagem excessiva e perda de contexto.
+  - `QuizHeader.tsx`: Cronômetro cirúrgico e contador de questões em `font-mono-lab tabular-nums`, filtros por banca e barra de progresso com hairlines.
+  - `AlternativeList.tsx`: Indicadores `[A]`-`[E]` em caixa mono, riscador de distratores de baixa latência (<100ms) sem oscilação de layout e preservação integral de acessibilidade.
+  - `DiscursiveAssessmentSection.tsx`: Seção discursiva com critério de correção barema oficial e autoavaliação guiada.
+- **Módulo de Revisão Ativa FSRS v6 (`src/app/revisao-ativa/`)**:
+  - `FlashcardClient.tsx`: Telemetria cognitiva FSRS v6 calibrada para questões médicas longas com intervalos projetados visíveis nos botões (`[1] Errei • Volta amanhã (D+1)`, `[2] Difícil • ~7 dias (D+7)`, `[3] Fácil • ~18 dias+ (D+18)`), atalhos ergonômicos de teclado (Espaço para virar, 1/2/3 para avaliar).
+- **Módulo OSCE & Arena de Simulação (`src/app/osce/`)**:
+  - `OsceHubClient.tsx`: Seletor de abas (Treino Avulso vs Circuito Oficial de 5 Estações), gerador de casos adaptativos FMRP-USP em estilo laboratório clínico e cards de estações com desempenho de barema em `font-mono-lab`.
+  - `MultiparameterMonitor.tsx`: Monitor hospitalar multiparamétrico industrial (`#090d18`) com formas de onda ECG, pleto e capnografia em SVG 60fps e dígitos laboratoriais `font-mono-lab tabular-nums tracking-tighter`.
+- **Validação de Qualidade & Regras Invioláveis**:
+  - 100% de aprovação na suíte de testes unitários do frontend (`npm run test:unit`: 74/74 testes passando).
+  - 100% de aprovação na suíte pytest do backend (410/410 testes passando).
+  - Build de produção do Next.js aprovado com orçamentos de performance cumpridos.
+  - Zero alterações em comentários de professores de residência médica (`explanations` canônicos preservados como estritamente somente-leitura).
+  - Zero código Google Apps Script.
+
+## [2026-10-16] - Etapa 4 do Novo Simulador OSCE: Avaliação Live de Barema, Red Flags com Travas de Segurança, Espelho Oficial de 2ª Fase & Feedback do Preceptor
+- **Motor Determinístico de Detecção de Erros Críticos Eliminatórios (`RedFlagEngine` em `app/backend/api/osce.py`)**:
+  - Implementada a função `evaluate_osce_red_flags` mapeando violações capitais de segurança do paciente:
+    - `RF_ANAT_NEUROVASC`: Laceração do feixe vásculo-nervoso intercostal por punção na borda inferior da costela (dedução de 2.5 pts, trava teto da estação em 4.0/10.0).
+    - `RF_ANAT_THYROID`: Transfixação do istmo da glândula tireoide em cricotireoidostomia cirúrgica com hemorragia e asfixia (dedução de 3.0 pts, trava teto em 3.0/10.0).
+    - `RF_ELEC_UNSYNC_VT`: Disparo elétrico desincronizado em taquiarritmia com pulso com risco de indução de FV por fenômeno R-sobre-T (dedução de 3.0 pts, trava teto em 3.0/10.0).
+    - `RF_ABCDE_VIOLATION`: Atropelo da sequência do ATLS por solicitação de exames de imagem secundários em tórax hipertensivo antes da descompressão de alívio.
+    - `RF_PHARM_CONTRA`: Prescrição farmacológica de alto risco (betabloqueador em choque cardiogênico ou cocaína).
+  - Cálculo oficial da nota ponderada com travas de teto de segurança (`caps_station_at`) e emissão de veredito canônico: `APROVADO COM DISTINÇÃO`, `APROVADO NO LIMITE`, `REPROVADO POR TÉCNICA` e `ELIMINADO POR IATROGENIA`.
+- **Radar de 5 Competências Médicas Fundamentais (`compute_competency_radar_5d`)**:
+  - Cálculo psicométrico em 5 eixos essenciais de prova de 2ª fase: Raciocínio Clínico, Comunicação & Empatia, Semiotécnica & Habilidades Práticas, Segurança do Paciente e Eficiência SUS / Gestão do Tempo.
+- **Parecer do Preceptor Chefe & Prescrição de Remediação (`build_chief_preceptor_review`, `build_medquest_remediation`)**:
+  - Geração de parecer estruturado com resumo executivo, pontos fortes, correções críticas e a **Conduta Canônica Padrão-Ouro** adaptada ao caso da estação (passo a passo exato do R1 da USP).
+  - Prescrição dirigida de baralhos de flashcards e filtros do banco de questões para treino imediato das lacunas identificadas.
+- **Espelho Oficial de Prova de 2ª Fase no Frontend (`app/frontend/src/app/osce/[id]/StationResultMirror.tsx`)**:
+  - Interface clínica de alta precisão (estilo FUVEST/COMVEST/INEP):
+    - Header com badge da banca examinadora e nota oficial em destaque com cor temática do veredito.
+    - Seção dedicada para Red Flags / Iatrogenias Clínicas em destaque vermelho com consequência real e dedução de pontos.
+    - Spider Chart interativo em SVG puro leve (sem bibliotecas pesadas) renderizando a matriz de 5 competências.
+    - Parecer do Preceptor Chefe com caixa de destaque da Conduta Canônica Padrão-Ouro.
+    - Tabela do Checklist Barema Oficial com filtros por categoria (Anamnese, Exame Físico, Procedimento, Diagnóstico, Conduta), timestamp `[MM:SS]` e evidência real capturada da telemetria.
+    - Footer com recomendação de baralhos e botão de refazer a estação prática.
+- **Integração Completa em `OsceRoomClient.tsx` & Suíte de Testes**:
+  - Substituída a visualização rústica anterior pelo `<StationResultMirror />` completo na fase `finished`.
+  - Adicionada a suíte `TestOsceStage4EvaluationAndMirror` em `app/backend/tests/test_osce.py` (28/28 testes de backend aprovados).
+  - Validação unificada com `./validate.sh fast` em 20.43s e zero erros de lint ou tipagem TypeScript.
+
+## [2026-10-16] - Etapa 3 do Novo Simulador OSCE: Gestão de Insumos SUS, Fila de Enfermagem com Latência & Manequim Cirúrgico 2D
+- **Manequim Cirúrgico 2D Vetorial com Iatrogenias Anatômicas (`app/frontend/src/lib/anatomy/mannequin-landmarks.ts`, `app/frontend/src/app/osce/[id]/ProcedureMannequin.tsx`)**:
+  - Arquitetura vetorial cirúrgica ortográfica em SVG multicamadas de ultraprecisão (<30KB, 60fps), descartando o 3D/WebGL por inviabilidade ergonômica sob estresse temporal de 8 minutos de prova.
+  - Mapeamento milimétrico de hitboxes anatômicos seguros e zonas de perigo iatrogênico:
+    - Toracocentese de alívio: diferenciação da borda superior da costela (segura) vs borda inferior (iatrogenia grave por laceração da artéria intercostal).
+    - Cricotireoidostomia de emergência: incisão na membrana cricotireoidea vs incisão baixa sobre o istmo da glândula tireoide (hemorragia maciça).
+    - Drenagem torácica tubular no 5º EIC na linha axilar média (triângulo de segurança de Bülau) com fixação em bailarina.
+    - Janelas completas do E-FAST (POCUS): Espaço de Morrison (RUQ), Recesso de Koller / Esplenorrenal (LUQ), Janela Pélvica / Suprapúbica e Janela Subxifoide / Pericárdica.
+    - Acesso vascular de emergência: Punção intraóssea tibial proximal vs Cateterismo venoso central por técnica de Seldinger.
+  - Alternância rápida entre Modo Treino Anatômico (com guias visuais e hitboxes transparentes) e Modo Prova Real (silhueta cirúrgica nua sem pistas visuais).
+- **Gestão de Insumos Críticos e Matrizes de Atenção do SUS (`app/frontend/src/types/osce-stage3.ts`)**:
+  - Matrizes de insumos calibradas para três níveis de complexidade: `UBS` (Atenção Básica), `UPA` (Pronto Atendimento) e `TERTIARY_TRAUMA` (Hospital Terciário).
+  - Bloqueio físico de condutas: procedimentos cirúrgicos complexos (ex: dreno de tórax) exigem preparação prévia de bandeja de instrumentação (`requiresPreparedSupplyId`), impedindo realização sem material esterilizado.
+- **Fila de Enfermagem com Latência Realista (`app/frontend/src/lib/engine/nursing-queue-engine.ts`)**:
+  - Catálogo de ordens de enfermagem (`NURSING_CATALOG`) com latência clínica real (20 a 40 segundos por ordem).
+  - Gerenciador de fila `NursingQueueManager` respeitando dimensionamento de equipe (`maxNurses` por complexidade do SUS) e priorização com preempção de tarefas em PCR / choque circulatório.
+- **Backend & Avaliação de Procedimentos (`app/backend/api/osce.py`)**:
+  - Atualizada a função `perform_osce_procedure` para auditar os novos sítios cirúrgicos, registrar achados do E-FAST com entrega de imagem, e pontuar desfechos ou iatrogenias no barema oficial.
+- **Testes & Validação**:
+  - Criada classe `TestOsceStage3MannequinAndProcedures` em `app/backend/tests/test_osce.py` cobrindo janelas E-FAST, iatrogenias de borda de costela e tireoide, acesso intraósseo e dreno torácico (25/25 testes de backend aprovados).
+  - Suíte completa validada com `./validate.sh fast` em 16.41s e zero erros de lint ou tipagem TypeScript.
+
+## [2026-10-16] - Etapa 2 do Novo Simulador OSCE: Palco Clínico Triplo, Semiotécnica Bruta Acústica & Roteador Dual-Agent
+- **Roteador Dual-Agent & Modulação Fisiológica no Backend (`app/backend/api/osce.py`, `app/backend/api/osce_routes.py`)**:
+  - Implementada função `get_hemodynamic_speech_modifier(vitals)` modulando cognição e fonação do paciente (GCS $\le 8$ restringe a gemidos guturais/silêncio, GCS 9-12 gera confusão/lentidão, $\text{SpO}_2 < 88\%$ ou $\text{FR} > 30$ corta fala em frases curtas entrecortadas com `[arfa]`/`[puxa o ar]`, choque $\text{PAS} < 90$ gera sussurros).
+  - Implementado `build_patient_system_prompt` com *Information Gating* rigoroso: paciente NUNCA entrega de bandeja fatores ocultos (sildenafila, abandono de insulina, uso de substâncias, antecedentes) sem pergunta direta e específica do aluno.
+  - Implementado `build_examiner_system_prompt` com postura neutra, técnica e fria: exigência de especificidade semiológica, bloqueio de complexidade do SUS ("Recurso indisponível nesta unidade") e proibição de laudos de ausculta em texto ("Utilize o estetoscópio interativo diretamente no manequim").
+  - Atualizada rota `/api/osce/sessions/<id>/interact` e função `interact_osce_session` recebendo `target: "PATIENT" | "EXAMINER"` e `current_vitals`.
+  - Função `_build_auscultation_foci` mapeando focos anatômicos calibrados para cada estação (cardíaco e pulmonar).
+- **Semiotécnica Bruta Acústica com Web Audio API (`app/frontend/src/app/osce/[id]/StethoscopeAudioEngine.ts`)**:
+  - Criado sintetizador DSP biomédico procedural de zero dependências externas de áudio, modulado pela FC e FR reais.
+  - Síntese de 6 fenômenos acústicos semiológicos: Murmúrio Vesicular Fisiológico, Estertores Crepitantes Teleinspiratórios (pulsos de 6ms em alta frequência), Sibilos Expiratórios Polifônicos (duplo oscilador harmônico dente de serra), Sopro Holossistólico Rude em Diamante (ruído passa-banda 240Hz), Atrito Pericárdico Trifásico (raspagem áspera 750Hz) e Bulhas B1/B2 normofonéticas.
+- **Palco Clínico Imersivo (`app/frontend/src/app/osce/[id]/ClinicalStage.tsx`)**:
+  - Destruído o formato "chat de WhatsApp": implementado HUD cinematográfico exibindo apenas as duas últimas falas com *fade-in/fade-out* (forçando atenção ativa como na prova real).
+  - Seletor tático de canal (Falar ao Paciente vs Dirigir-se ao Examinador) com atalho de teclado `Tab`.
+  - Prontuário de Bolso retrátil persistente para anotações de raciocínio clínico do aluno.
+  - Silhueta anatômica vetorial torácica com campânulas de ausculta interativas ativadas ao empunhar o estetoscópio (`ESC` para guardar).
+  - Conectado em `OsceRoomClient.tsx` recebendo sinais vitais dinâmicos do `VitalStateEngine`.
+- **Testes & Validação**:
+  - Suíte `TestOsceStage2DualAgentAndAuscultation` adicionada com 3 testes unitários novos (21/21 testes de backend passando).
+  - Validação completa com `./validate.sh fast` em 18.59s e ESLint 100% limpo.
+
+## [2026-10-16] - Etapa 1 do Novo Simulador OSCE: Motor Fisiológico Reativo (VitalStateEngine) & Monitor Multiparamétrico 60fps
+- **Motor Fisiológico Reativo em Tempo Real (`app/frontend/src/app/osce/[id]/useVitalStateEngine.ts`)**:
+  - Implementado o hook `useVitalStateEngine` com cálculo determinístico de ciclo hemodinâmico a 1Hz, modelando $S(t) = S_0 + \vec{D}_{\text{patologia}} + \sum \vec{I}_{\text{intervenções}} + \vec{\epsilon}(t)$.
+  - Incorporada farmacocinética dinâmica (latência de início *onset*, pico e duração) para infusões de cristaloides, amiodarona, adenosina, noradrenalina, insulina e protocolo de transfusão maciça (1:1:1).
+  - Adicionado jitter estocástico fisiológico ($\pm 1\%$) para oscilação natural dos parâmetros numéricos.
+  - Implementada simulação de manguito de Pressão Não-Invasiva (PNI) com atraso de insuflação e cálculo da Pressão Arterial Média (PAM).
+- **Monitor Multiparamétrico Virtual da Sala Vermelha (`app/frontend/src/app/osce/[id]/MultiparameterMonitor.tsx`)**:
+  - Renderização contínua a 60 fps em HTML5 `<canvas>` com feixe de varredura (*sweep bar*) para traçados de ECG DII (verde) e Pletismografia de Oximetria SpO2 (ciano).
+  - Formas de onda procedurais para ritmos clínicos: Ritmo Sinusal, Taquicardia Sinusal, TSV, Taquicardia Ventricular Monomórfica, Fibrilação Ventricular e Assistolia.
+  - Sintetizador Psicoacústico via Web Audio API: bips na sístole modulados pela oximetria ($f = 440 + (\text{SpO}_2 - 80) \times 18\text{ Hz}$) e alarmes normatizados IEC com silenciamento por 2 minutos.
+  - Modal tático de cardioversor/desfibrilador manual permitindo choque sincronizado ou desincronizado (com disparo de FV iatrogênica em caso de choque desincronizado em TV com pulso).
+- **Backend & Modelagem de Fisiologia (`app/backend/api/osce.py`, `app/backend/api/osce_data.py`)**:
+  - Função `_build_physiology_engine` com fallback determinístico e regras de progressão natural calibradas para as estações de choque e arritmias (`UNIFESP-2024-CM-TV`, `USP-RP-2024-CM-CAD`, `USP-RP-2023-CG-FAST`).
+  - Atualizado endpoint `GET /api/osce/stations/<id>` expondo `physiology_engine` estruturado.
+  - Novo teste unitário `test_osce_physiology_engine` em `app/backend/tests/test_osce.py` (18/18 testes aprovados).
+  - Validação completa com `./validate.sh fast` (14.97s, zero erros de ESLint e testes verdes).
+
+## [2026-10-15] - Execução Argon: Correções Cirúrgicas de Segurança (P0) e Resiliência de IA/Idempotência (P1)
+- **Segurança de Credenciais e Governança Canônica (`app/backend/scripts/`)**:
+  - `deepseek_map_hours.py`: Eliminada credencial Bearer da API DeepSeek exposta em texto claro; implementada leitura obrigatória via `os.environ["DEEPSEEK_API_KEY"]` com *fail-fast*.
+  - `medway_client.py`: Removidas credenciais estáticas de Firebase (`FIREBASE_API_KEY`) e token de autenticação hardcoded, migrando para variáveis de ambiente.
+  - `rewrite_medquest_explanations.py`: Purgadas credenciais padrão e adicionado bloqueio definitivo via `RuntimeError` para salvaguardar a diretriz inviolável de imutabilidade de comentários canônicos elaborados por professores de residência.
+- **Proteção contra Prompt Injection e Hardening de Autenticação (`app/backend/api/`)**:
+  - `ai.py`: Criada a função `_sanitize_prompt_input` com truncagem e neutralização de tags estruturais; enclausuradas as entradas livres do estudante em tags explícitas (`<student_query>`, `<student_response>`) nos modos de réplica e dúvida livre; reforçado o `system_instruction` do Preceptor IA com cláusula de bloqueio a jailbreaks e comandos de fuga.
+  - `auth.py`: Criada a função `_is_testing_env` vinculando o bypass de teste estritamente a ambientes que não sejam de produção (`FLASK_ENV != "production"` e ausência de variáveis cloud/Render), blindando `require_auth`, `auth_me` e `require_curator`.
+- **Resiliência de Rede e Circuit Breaker em IA (`app/backend/api/universal_pool.py`)**:
+  - `universal_pool.py`: Implementado `CircuitBreaker` em memória com estados `CLOSED`, `OPEN` e `HALF_OPEN`; chamadas consecutivas com falha ativam Fast-Fail em $< 5\text{ms}$ prevenindo que workers Gunicorn fiquem retidos em chamadas externas degradadas; ajustado orçamento de timeout síncrono para 20s.
+  - `tests/test_universal_pool.py`: Adicionado teste unitário `test_circuit_breaker_fast_fail` cobrindo abertura de circuito e rejeição imediata (7/7 testes aprovados).
+- **Idempotência e Rastreabilidade de IA (`app/backend/api/questions.py`, `app/backend/api/ai_routes.py`)**:
+  - `questions.py`: Integrado `reserve_idempotency` e `complete_idempotency` na rota `POST /simulado/sessions`, prevenindo duplicação de sessões e eventos em retries de rede.
+  - `ai_routes.py`: Padronizada a proveniência `source = 'ai_synthesized'` e persistido `generated_at` no salvamento de explicações geradas por IA em `synthesize_explanation`.
+- **Frontend & PWA (`app/frontend/src/lib/db.ts`)**:
+  - `db.ts`: Adicionado fallback defensivo em `purgeExpiredSimuladoPackages` para adaptadores do Dexie sem suporte a `.where()`, restaurando 100% de aprovação na suíte de testes unitários do frontend (74/74 testes passando em `npm run test:unit`).
+- **Validação de Regressão Zero**:
+  - 399 testes de backend aprovados no `pytest`.
+  - 74 testes unitários de frontend aprovados no Node.js test runner.
+  - `./validate.sh fast` aprovado com sucesso em 18.25s e ESLint 100% limpo.
+
+---
+- **Persistência Distribuída e Resiliência LibSQL / SQLite (`app/backend/api/db.py`)**:
+  - Implementada função `_sanitize_params` preservando parâmetros do tipo `dict` para queries nomeadas (`:param`), garantindo decodificação UTF-8 defensiva (`replace`) em strings e sequências sem corromper binários.
+  - Refinada a função `_is_read_only_query` com regex de palavras-chave mutadoras (`INSERT|UPDATE|DELETE|REPLACE|DROP|ALTER|...`), prevenindo que CTEs com escrita (`WITH ... DELETE/UPDATE`) sejam tratadas indevidamente como leitura e sofram retries duplicados.
+  - Eliminado `TursoCursor.__del__` que disparava chamadas FFI/Rust durante o Garbage Collection em threads arbitrárias do Python; cursores de escrita (sem colunas) agora são fechados deterministicamente em `__init__`.
+  - Tratamento defensivo em `TursoConnection.commit()` executando rollback e reconexão automática em caso de stream expirado; adicionado suporte a `SAVEPOINT` no context manager `db_transaction` para transações aninhadas seguras no SQLite local.
+- **Harmonização do Motor FSRS v6 e Inteligência Adaptativa (`app/backend/api/adaptive.py`)**:
+  - Unificada a instância do scheduler FSRS: `adaptive.py` agora importa `_question_scheduler` e `_safe_load_card` diretamente de `app/backend/api/srs.py`, garantindo paridade total com a calibração médica (retenção alvo 0.85, estabilidades $S_0$ e decaimento temporal idêntico).
+- **Otimização do Pool de IA e Blindagem de Explicações Canônicas (`app/backend/api/gemini_pool.py`, `app/backend/api/ai_routes.py`)**:
+  - `gemini_pool.py`: Corrigido o cálculo de `consecutive_429` e garantido piso mínimo de multiplicador (`max(1, ...)`); refatorado `get_available_key` para liberar o `lock` do pool antes de `time.sleep`, eliminando contenção de threads WSGI; filtrados blocos `"thought": true` nas partes de resposta de modelos Gemini 2.5/Flash para evitar vazamento de raciocínio interno nas explicações.
+  - `ai_routes.py`: Reforçada a blindagem contra race condition na persistência de explicações sintetizadas, garantindo que a tabela `explanations` nunca sobrescreva explicações canônicas de professores já existentes.
+- **Frontend, PWA e Otimização do Cache Dexie (`app/frontend/src/lib/db.ts`, `QuizClient.tsx`)**:
+  - `db.ts`: Refatorado `purgeExpiredSimuladoPackages` para consultar diretamente os índices do Dexie (`expires_at` via `between` e `status` via `equals`) eliminando `toArray()` (full table scan em memória); restrita a exposição de `localDb` no objeto `window` apenas para ambiente de desenvolvimento (`NODE_ENV !== "production"`).
+  - `QuizClient.tsx`: Marcada data sentinela otimista em `handleReviewFSRS` (`attemptResultRef.current = optimisticResult`), eliminando race condition que disparava reavaliação neutra concorrente (`duvida`) ao transicionar de questão.
+  - Validação completa: 112 testes de backend aprovados e ESLint frontend 100% limpo em `./validate.sh fast`.
+
+---
+
+## [2026-10-12] - Entrega: Analisador Multimodal de Exames Médicos de Imagem (Padrão Ouro Semiológico)
+- **Visão Computacional e Roteiros Semiológicos Canônicos (Backend & IA)**:
+  - `app/backend/api/medical_vision.py`: Implementado o motor de análise multimodal com pré-processamento e redimensionamento proporcional inteligente via Pillow (`otimizar_imagem_para_analise`), roteiros semiológicos estruturados (ECG 12 derivações em 6 passos FMRP-USP/SBC, RX de tórax em ABCDE, TC de crânio com detecção de sangramentos agudos e desvio de linha média, Dermatologia com regra do ABCDE e OCR de exames laboratoriais); implementada a regra crítica de segurança com injeção obrigatória do Alerta de Sala Vermelha (`🚨 [ALERTA DE EMERGÊNCIA - SALA VERMELHA]`) na primeira linha do laudo em achados críticos.
+  - `app/backend/api/gemini_pool.py`: Expandido o método `generate_content` para suportar `parts` multimodais arbitrárias contendo `inlineData` (base64) com balanceamento Round-Robin, fallback automático e função singleton `get_gemini_pool()`.
+  - `app/backend/api/ai_routes.py`: Criado o endpoint `POST /api/ai/analyze-image` (e `/api/v1/ai/analyze-image`) aceitando imagens via multipart/form-data ou JSON (`image_base64`), modalidade e contexto clínico.
+  - `app/backend/tests/test_medical_vision.py`: Criada suíte completa com 6 testes unitários e de integração validando otimização de imagem, extração de alertas críticos, rotas de API, suporte a base64 e multipart (100% de aprovação em `./validate.sh fast`).
+  - `tooling/testador_master/`: Integrada a ação `analisar_exame_imagem` ao `DriverAPI`, personas médicas (`candidato_osce_pratico` e `r1_residencia_elite`), grafo de cobertura e dashboard visual interativo.
+
+---
+
+## [2026-10-12] - Ciclo Autoloop: Otimização de Renderização e Memoização nos Badges de Subtemas Clínicos
+- **Desempenho Frontend e Ergonomia de Busca em Filtros de Estudo (Frontend)**:
+  - `app/frontend/src/app/estudar/components/QuizFilters.tsx`: Criados subcomponentes puros memoizados `SubtemaChip` e `SubtemaDropdownItem` via `React.memo`, eliminando re-renders supérfluos; implementados hooks `useMemo` para normalização de array e `Set` de subtemas selecionados em $O(1)$, eliminando duplo filtro/slice inline no render; callbacks estáveis com `useCallback` (`handleRemoveSubtema`, `handleClearAllSubtemas`, `handleAddSubtema`) e adicionado atalho de teclado `Enter` no input de busca para seleção imediata do primeiro subtema filtrado com atributos ARIA (`role="listbox"`, `role="option"`).
+  - `app/frontend/scripts/tests/quiz-filters-optimization.test.mjs`: Criada suíte com 5 testes unitários validando normalização defensiva, filtragem case-insensitive com exclusão em $O(1)$, teto de 50 itens e operações atômicas de adição e remoção de filtros (100% de aprovação em `npm run test:unit`, `npm run lint` e `./validate.sh fast`).
+
+---
+
+## [2026-10-12] - Ciclo Autoloop: Modelo de Domínio e Vocabulário Ubíquo da Plataforma Médica
+- **Formalização do Modelo de Domínio e Vocabulário Ubíquo (Documentação & Arquitetura)**:
+  - `GLOSSARY.md`: Criado documento canônico de vocabulário ubíquo estruturado pelas 4 dimensões essenciais da plataforma: *Conteúdo Médico e Curadoria Clínica* (Questão de Residência, Comentário do Professor/Explicação Canônica imutável, Grande Área, Subtema Canônico, Pulo do Gato), *Aprendizado Adaptativo e Repetição Espaçada* (FSRS v6, Estabilidade $S$, Dificuldade $D$, Grau de Confiança e Fila de Revisão do Dia D+1), *Avaliação Psicométrica e Modos de Treino* (Teoria de Resposta ao Item - TRI, Simulado e Caderno de Erros) e *Sincronização Local-First e Identidade* (Pacote Offline, Fila de Sincronização Transacional e Sessão Visitante/Modo Convidado). O glossário estabelece termos recomendados e termos a evitar (`_Evitar_`), eliminando ambiguidades conceituais em agentes autônomos, testes e documentação.
+
+---
+
+## [2026-10-12] - Ciclo Autoloop: Trap-Focus, Acessibilidade ARIA e Navegação por Teclado em Modais de Curadoria Médica
+- **Ergonomia Frontend e Acessibilidade WCAG 2.1 AA em Modais (Frontend)**:
+  - `app/frontend/src/lib/modalAccessibility.ts`: Criado módulo utilitário universal de acessibilidade com as funções `getFocusableElements(container)` (extração e filtragem de elementos focáveis interativos, ignorando desabilitados ou `aria-hidden`) e `handleModalKeyNavigation(event, options)` (gerenciador determinístico de trap-focus circular com Tab/Shift+Tab, atalho Escape com priorização de fechamento de subdiálogos e atalho rápido Ctrl+Enter/Cmd+Enter para submissão imediata).
+  - `app/frontend/src/components/QuestionClassificationModal.tsx`: Integrada a gestão de foco acessível: memorização do elemento acionador original (`document.activeElement`) ao abrir com restauração de foco ao fechar, foco inicial automático no campo de busca de subtemas, vinculação semântica ARIA (`aria-describedby="classification-modal-description"`), atalho `Enter` no input de busca para seleção imediata de subtema único e anéis visuais de foco (`focus-visible:ring-2 focus-visible:ring-primary focus-visible:outline-none`) em todos os botões e campos interativos.
+  - `app/frontend/scripts/tests/modal-trap-focus.test.mjs`: Criada suíte com 8 testes unitários cobrindo trap-focus, tecla Escape com e sem modal de confirmação, short-circuit em estado ocupado, atalhos Ctrl/Cmd+Enter e filtragem de elementos focáveis (100% de aprovação em `npm run test:unit`, `npm run lint` e `./validate.sh fast`).
+
+---
+
+## [2026-10-12] - Entrega: Testador Master Ostensivo do MedQuest (E2E & API com Personas Médicas e TUI)
+- **Robô Autônomo de Alta Fidelidade para Auditoria e Testes Contínuos (Tooling & Scripts)**:
+  - `tooling/testador_master/testador_master.py`: Implementado o orquestrador com CLI completo (`--mode`, `--persona`, `--cycles`, `--duration`, `--delay`, `--no-clear`), loop de eventos, encerramento gracioso e salvamento contínuo de relatórios.
+  - `tooling/testador_master/personas.py`: Criado o catálogo de personas médicas (*Internato Generalista*, *R1 Residência Elite*, *Revisor FSRS Metódico*, *Candidato OSCE Prático*, *Caótico Fuzzer*), com objetivos de estudo, pesos de ações clínicas e balões de raciocínio.
+  - `tooling/testador_master/driver_api.py`: Driver in-memory ultrarrápido sobre Flask test-client cobrindo questões, FSRS v6, flashcards, simulados, TRI, estações práticas OSCE, estatísticas e busca semântica com latência sub-10ms.
+  - `tooling/testador_master/driver_e2e.py`: Driver de frontend integrado com Playwright para execução de jornadas visuais no Next.js (App Router).
+  - `tooling/testador_master/medical_oracle.py`: Oráculo de integridade médica com bloqueio inviolável de alteração de comentários canônicos de professores em `explanations`, validação de intervalos D+1+/D+7 do FSRS v6 e sanidade matemática do TRI.
+  - `tooling/testador_master/crawler_engine.py`: Motor de grafo de recursos e cobertura (`MedQuestGraph`) rastreando nós, arestas e métricas em `data/testador_master_grafo.json`.
+  - `tooling/testador_master/tui_renderer.py`: Interface rica de terminal (Anti-UI-Slop) com cores ANSI de alto contraste, telemetria em tempo real e visualização de raciocínio clínico.
+  - `tooling/testador_master/reporter.py` e `repro_generator.py`: Geração automática do relatório vivo executivo em `docs/RELATORIO_TESTADOR_MASTER.md`, dados em JSON e auto-geração de scripts de reprodução isolada em `tests/repros/` para falhas.
+  - `tooling/testador_master/dashboard_generator.py` & `docs/dashboard_grafo.html`: Dashboard visual autônomo e interativo em HTML gerado com Vis.js, exibindo rede de nós de telas e rotas de API, telemetria clínica, feed de personas em tempo real, filtros dinâmicos e métricas de cobertura física.
+  - `scripts/iniciar_testador_master.sh`: Launcher em bash para execução interativa em janela visível de monitor.
+
+---
+
+## [2026-10-12] - Ciclo Autoloop: Prefetch PWA Transacional Offline de Próximas Questões do Caderno
+- **Transição com Latência 0ms e Cache Offline Atômico no Dexie (Frontend)**:
+  - `app/frontend/src/lib/db.ts`: Implementado o método `getCachedQuestionIds` na classe `MedQuestDB` e utilitário exportado para consulta rápida em lote de IDs persistidos no IndexedDB por `_owner_id`.
+  - `app/frontend/src/lib/syncQueue.ts`: Criado o módulo unificado de prefetch offline com as funções `prefetchUpcomingQuestions(themeId, limit = 10)` e `prefetchQuestionsByIds(ids, options)`, implementando sanitização defensiva, isolamento SSR, desduplicação de chamadas concorrentes em memória e sincronização transacional atômica via `syncQuestions` com emissão de evento `questions-prefetched`.
+  - `app/frontend/src/app/estudar/QuizClient.tsx`: Integrado o pré-carregamento contínuo em segundo plano na rotação de questões e carregamento de lote inicial de 10 questões no `loadQueue`, garantindo transição sem latência mesmo com conexão intermitente.
+  - `app/frontend/scripts/tests/sync-queue-prefetch.test.mjs`: Criada suíte com 8 testes unitários cobrindo operação SSR, sanitização de IDs, short-circuit offline, integridade de transações Dexie e desduplicação de requisições concorrentes (100% de aprovação em `npm run test:unit`, `npm run lint` e `./validate.sh fast`).
+
+---
+
+## [2026-10-12] - Ciclo Autoloop: Recuperação Defensiva de JSON FSRS Corrompido e Contratos Padronizados
+- **Robustez e Recuperação Defensiva no Motor FSRS e Rotas de Questões (Backend)**:
+  - `app/backend/api/srs.py`: Implementada a função `_safe_load_card(card_json)` com deserialização defensiva contra JSONs truncados, malformados ou esquemas incompatíveis em `spaced_repetition.fsrs_card`, regenerando um `Card` padrão sem lançar exceções.
+  - `app/backend/api/questions.py`: Adicionado logging formal e blocos de fallback defensivo em `submit_attempt` (`POST /api/questions/<int:qid>/attempt`), `review_fsrs` (`POST /api/questions/<int:qid>/review`) e `_process_single_attempt` (`POST /attempt/batch`), prevenindo erro 500 no fluxo de estudo mesmo com registros de repetição corrompidos no banco.
+  - `app/backend/api/questions.py`: Padronizados os contratos de resposta de erro HTTP 400 e 404 em `submit_attempt`, `review_fsrs` e `question_detail` com códigos semânticos estruturados (`INVALID_INPUT`, `QUESTION_NOT_FOUND`, `NO_ATTEMPT_FOUND`) preservando retrocompatibilidade com o campo `error`.
+  - `app/backend/tests/test_srs.py`: Adicionado teste unitário `test_review_recupera_json_corrompido_ou_invalido` cobrindo strings truncadas, tipos não-objeto, esquemas incompatíveis e strings vazias.
+  - `app/backend/tests/test_api.py`: Adicionados testes de integração `test_attempt_e_review_recupera_fsrs_card_corrompido` e `test_attempt_and_review_invalid_input_standard_code`, com 100% de aprovação (57 testes aprovados em `./validate.sh fast` e 390 testes em toda a suíte de backend).
+
+---
+
+## [2026-10-11] - Ciclo Autoloop: Recuperação de Quota e Evicção de Simulados Expirados no Dexie
+- **Recuperação de Quota e Evicção de Pacotes Expirados (Frontend)**:
+  - `app/frontend/src/lib/db.ts`: Implementadas a função `isQuotaExceededError` (detecção abrangente de erros de cota de armazenamento via DOMException código 22, nome, regex e wraps de transações/erros internos do Dexie) e o método transacional atômico `purgeExpiredSimuladoPackages`, purgado pacotes expirados (`status === 'expired'` ou `expires_at <= now`) da tabela `simuladoPackages` e emitindo evento `simulado-packages-purged`; integrado guardrail de recuperação em `syncQuestions` para purgar pacotes vencidos e retentar atomicamente a persistência de questões antes de abortar/relançar o erro caso não haja espaço liberado.
+  - `app/frontend/src/lib/simuladoPackage.ts`: Atualizado tratamento de erro de download de simulado para reutilizar o helper canônico `isQuotaExceededError`.
+  - `app/frontend/scripts/tests/sync-questions-cache.test.mjs`: Expandida suíte de testes com 5 novos cenários (totalizando 10 testes unitários), validando detecção de erros de cota, purga atômica e preservação de pacotes válidos, retentativa bem-sucedida após liberação de espaço, aborto com propagação de erro quando não há pacotes expirados, e execução defensiva em SSR (100% de aprovação em `npm run test:unit`, `npm run lint` e `./validate.sh fast`).
+
+---
+
+## [2026-10-11] - Ciclo Autoloop: Guardrail de Sanitização e Parsing Defensivo em ExplanationViewer
+- **Sanitização de Delimitadores Residuais e Robustez em Explicações (Frontend)**:
+  - `app/frontend/src/components/ExplanationViewer.tsx`: Implementada a função `cleanSectionDelimiters` e atualizada a função `parseExplanation` com guardrails defensivos (`try/catch`, validação estrita de tipos e fallback gracioso), eliminando delimitadores residuais órfãos (asteriscos de fechamento em cabeçalhos colon-inside como `**Cabeçalho:**`, dois-pontos soltos, divisores horizontais vazios e quebras) em todas as seções clínicas (`puloDoGato`, `raciocinioClinico`, `padraoResposta`, `alternativaCorreta` e `distratores`), eliminando distratores fantasmas e preservando estritamente a formatação legítima de listas e comentários canônicos de professores.
+  - `app/frontend/scripts/tests/explanation-viewer-sanitization.test.mjs`: Criada suíte com 5 testes unitários cobrindo sanitização de delimitadores órfãos, fallback defensivo para dados nulos/corrompidos/não-string, comentários colon-inside, seções discursivas e isolamento de Raciocínio Clínico (100% de aprovação em `npm run test:unit` e `./validate.sh fast`).
+
+---
+
+## [2026-10-11] - Ciclo Autoloop: Clamp Defensivo de Intervalo Mínimo D+1 no FSRS
+- **Integridade Temporal e Robustez no Agendamento SRS (Backend)**:
+  - `app/backend/api/srs.py`: Implementado clamp defensivo incondicional na função `review` assegurando que todo agendamento `due` gerado respeite rigorosamente `D+1` (`>= 24 horas` a partir de `now`), protegendo tanto o payload do `Card` serializado quanto o valor ISO retornado contra drift de relógio do servidor, passos intradia acidentais ou estados numéricos degenerados, mantendo suporte opcional a `now` determinístico para testes e auditorias temporais.
+  - `app/backend/tests/test_srs.py`: Adicionados testes unitários `test_defensive_clamp_forces_minimum_d_plus_one` e `test_defensive_clamp_preserves_longer_intervals` na suíte `TestFSRSValidation`, comprovando o clamp em agendamentos simulados no passado ou intradia (< 24h) e garantindo a preservação exata de intervalos legítimos de longa maturação (~7d a ~78d) (100% de aprovação na suíte de testes).
+
+---
+
+## [2026-10-11] - Ciclo Autoloop: Validação de Existência Prévia em Favoritos
+- **Integridade Referencial e Validação de Favoritos (Backend)**:
+  - `app/backend/api/questions.py`: Implementada verificação de existência prévia de questão na rota `toggle_favorite` (`POST /api/questions/<int:qid>/favorite`), retornando HTTP 404 (`{"error": "Questão não encontrada"}`) e liberando token de idempotência caso a questão não exista no banco, prevenindo inserção de chaves órfãs na tabela `favorites`.
+  - `app/backend/tests/test_api.py`: Adicionado teste unitário `test_question_favorite_not_found` validando resposta HTTP 404 para toggle padrão, favorito explícito (`is_favorite=True`), desfavoritar explícito (`is_favorite=False`) e assegurando ausência de registros órfãos persistidos na tabela `favorites` (100% de aprovação na suíte de testes).
+
+---
+
+## [2026-10-11] - Ciclo Autoloop: Resiliência de Cache e Rollback Transacional no Dexie
+- **Resiliência e Atomicidade no Cache Offline (Frontend)**:
+  - `app/frontend/src/lib/db.ts`: Implementado método `syncQuestions` na classe `MedQuestDB` e helper exportado `syncQuestions`, provendo sincronização transacional atômica (`rw`) no Dexie com rollback automático, isolamento por `_owner_id` e validação defensiva pré-transação contra registros malformados ou IDs inválidos.
+  - `app/frontend/src/lib/simuladoPackage.ts`: Refatorado download de pacotes de simulado para persistir lotes de questões através de `localDb.syncQuestions(details, uid)`, substituindo chamada direta e frágil a `bulkPut` por operação transacional protegida contra dados parciais.
+  - `app/frontend/scripts/tests/sync-questions-cache.test.mjs`: Criada suíte com 5 testes unitários validando atomicidade, rejeição estrita de dados corrompidos antes de transações, vinculação de `_owner_id`, garantia de rollback em falhas de I/O / cota e operação segura em ambiente SSR (100% de aprovação em `npm run test:unit`).
+
+---
+
+## [2026-10-11] - Ciclo Autoloop: Testes de Estresse e Invariantes do FSRS v6
+- **Validação de Invariantes Temporais e Estresse no Motor FSRS (Backend)**:
+  - `app/backend/tests/test_srs.py`: Implementada a classe de testes `TestFSRSValidation` cobrindo calibração de parâmetros (`desired_retention=0.85`, `learning_steps=()`, `relearning_steps=()`, `_QUESTION_PARAMS`), estresse sob 25 erros consecutivos em questões e flashcards, simulação temporal realista de 64 revisões mistas, recuperação de estabilidade pós-lapso e garantia de que nenhum agendamento gere passos intradia (< 24h) ou intervalos negativos.
+
+---
+
+## [2026-10-11] - Ciclo Autoloop: Otimização de Contagem de Questões e Cache TTL
+- **Performance e Resiliência na Contagem de Questões (Backend)**:
+  - `app/backend/api/questions.py`: Implementado suporte unificado a `/api/questions/count` e `/api/questions/counts` com cache em memória `count_cache` (TTL 60s, max 1000 entradas), separando escopo de catálogo global de filtros atrelados a usuário (`status`, `unanswered_only`, `favorite`), com tempo de resposta < 10ms.
+  - `app/backend/api/questions.py`: Invalidação de `count_cache` por usuário integrada à rotina `invalidate_user_caches(user_id)` após respostas e revisões.
+  - `app/backend/tests/test_api.py`: Expandido teste `test_questions_count_with_filters` validando alias `/counts`, combinação de `area` e `subtema` via índice composto `idx_questions_area_subtema`, resposta imediata do cache em memória e invalidação atrelada ao usuário.
+
+---
+
+## [2026-10-11] - Ciclo Autoloop: Tipagem Estrita e Acessibilidade em Componentes de Questão
+- **Acessibilidade e Semântica ARIA no Frontend**:
+  - `app/frontend/src/app/estudar/components/AlternativeList.tsx`: Adicionado container com `role="region"` e `aria-label="Alternativas da questão"`, `aria-label` descritivo e sintetizado em cada alternativa com estado dinâmico (selecionada/riscada/gabarito), além de `aria-hidden="true"` nos ícones e marcadores visuais.
+  - `app/frontend/src/components/ExplanationViewer.tsx`: Adicionado `aria-hidden="true"` em todos os ícones decorativos de cabeçalho (`Award`, `Sparkles`, `Stethoscope`, `CheckCircle2`, `XCircle`, `AlertCircle`) e atributos acessíveis no modal de zoom de imagens médicas.
+  - `app/frontend/src/components/QuestionClassificationModal.tsx`: Vinculado `aria-labelledby="classification-modal-title"`, `aria-pressed` nos seletores de Grande Área e subtema, e `aria-hidden="true"` em todos os ícones funcionais e de feedback.
+  - `app/frontend/src/components/PreceptorFocusCard.tsx`, `QuizTimer.tsx`, `SubjectTreeSelector.tsx`, `OfflinePanel.tsx`, `ImageViewer.tsx`, `FormattedContent.tsx`: Reforçados papéis acessíveis de timer, diálogos modais e zoom.
+- **Blindagem de Deploy e Imutabilidade de Explicações**:
+  - `deploy.py` e `tests/test_deploy.py`: Implantação de lock físico de exclusão mútua (`fcntl.flock`), verificação obrigatória de branch `main`, integridade de SHA e validação de pareceres de auditoria.
+  - `app/backend/api/ai_routes.py`: Proteção estrita de explicações canônicas de professores (`canonical_professor_locked`), impedindo regeneração e desperdício de tokens de IA.
+  - `app/backend/scripts/sync_db_turso.py`: Validação defensiva do payload retornado pelo Turso Pipeline HTTP.
+
+---
+
+## [2026-10-10] - Ciclo Autoloop: Auditoria e Cobertura de Testes Unitários de API
+- **Cobertura de Testes de API (Backend)**:
+  - `app/backend/tests/test_api.py`: Expandida suíte com 10 novos testes cobrindo filtros de área/ano/subtema, status wrong/answered, toggle de favoritos, contagens, overview zero-state, distratores e modos adaptativos.
+  - Correção do edge-case `NOT IN (NULL)` na query SQL de remediação.
+
+---
+
+## [2026-10-10] - Setup Inicial do Autoloop
+- **Setup Seguro Inicial**:
+  - Configuração da branch segura `autoloop/dev` e criação de `PROGRESS.md`.
+  - Correção de data fixa em `test_planner.py`.
